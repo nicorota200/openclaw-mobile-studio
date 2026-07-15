@@ -1,0 +1,23 @@
+{
+  "name": "openclaw-mobile-studio",
+  "version": "0.1.0",
+  "description": "Mobile-first control plane for supervising OpenClaw work from a phone.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicorota200/openclaw-mobile-studio.git"
+  },
+  "scripts": {
+    "dev": "node server.js",
+    "start": "NODE_ENV=production node server.js",
+    "visual:smoke": "node tests/visual-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

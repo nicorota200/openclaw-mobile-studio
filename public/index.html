@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111820" />
+    <title>OpenClaw Mobile Studio</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <button id="menuButton" class="icon-button square-button" type="button" aria-label="Open menu">Menu</button>
+        <div class="title-block">
+          <p class="eyebrow">OpenClaw</p>
+          <h1 id="viewTitle">Mobile Studio</h1>
+        </div>
+        <button id="refreshButton" class="icon-button" type="button">Refresh</button>
+      </header>
+
+      <aside id="sideMenu" class="side-menu" aria-hidden="true">
+        <div class="side-menu-panel">
+          <div class="side-menu-header">
+            <div>
+              <p class="eyebrow">OpenClaw</p>
+              <h2>Mobile Studio</h2>
+            </div>
+            <button id="closeMenuButton" class="icon-button square-button" type="button" aria-label="Close menu">Close</button>
+          </div>
+          <nav class="side-nav" aria-label="Main navigation">
+            <button class="nav-item active" type="button" data-view="home">Home</button>
+            <button class="nav-item" type="button" data-view="chat">Chat</button>
+            <button class="nav-item" type="button" data-view="files">Files</button>
+            <a class="nav-item" href="/" target="_blank" rel="noreferrer">Open File Browser</a>
+          </nav>
+        </div>
+      </aside>
+
+      <section class="status-strip" id="statusStrip">
+        <span class="status-dot"></span>
+        <span id="statusText">Connecting...</span>
+      </section>
+
+      <section id="homeView" class="view home-view active-view">
+        <section class="home-summary" id="homeSummary" aria-label="Operational summary"></section>
+        <section class="home-actions" aria-label="Primary actions">
+          <button class="home-action" type="button" data-home-action="chat">Chat</button>
+          <button class="home-action" type="button" data-home-action="projects">Projects</button>
+          <button class="home-action" type="button" data-home-action="workspace">Workspace</button>
+        </section>
+        <section class="home-section">
+          <div class="home-section-head">
+            <h2>Needs attention</h2>
+            <span id="homeUpdatedAt"></span>
+          </div>
+          <div id="attentionList" class="attention-list" aria-live="polite"></div>
+        </section>
+        <section class="home-section home-split">
+          <div>
+            <div class="home-section-head">
+              <h2>Projects</h2>
+            </div>
+            <div id="homeProjectList" class="mini-list"></div>
+          </div>
+          <div>
+            <div class="home-section-head">
+              <h2>Activity</h2>
+            </div>
+            <div id="homeAuditList" class="mini-list"></div>
+          </div>
+        </section>
+      </section>
+
+      <section id="chatView" class="view">
+        <section class="session-panel">
+          <label for="sessionSelect">Session</label>
+          <select id="sessionSelect"></select>
+          <div id="sessionMeta" class="session-meta"></div>
+        </section>
+        <section id="chatProjectStrip" class="project-strip" hidden></section>
+        <section id="runPanel" class="run-panel" hidden></section>
+
+        <section id="messageList" class="message-list" aria-live="polite"></section>
+
+        <form id="composer" class="composer">
+          <div class="command-row">
+            <button id="commandButton" class="command-toggle" type="button" aria-expanded="false">Cmd</button>
+            <div id="commandHint" class="command-hint">/new · /reset · /compact · /stop</div>
+          </div>
+          <div id="commandPalette" class="command-palette" hidden></div>
+          <textarea
+            id="messageInput"
+            name="message"
+            rows="1"
+            placeholder="Message OpenClaw"
+            autocomplete="off"
+          ></textarea>
+          <button id="sendButton" type="submit">Send</button>
+        </form>
+      </section>
+
+      <section id="filesView" class="view files-view" hidden>
+        <div id="fileBrowserScreen" class="file-screen active-file-screen">
+          <div class="files-toolbar">
+            <nav class="quick-links" aria-label="File shortcuts">
+              <button id="projectsShortcut" class="quick-link" type="button">Projects</button>
+              <button id="workspaceShortcut" class="quick-link" type="button">Workspace</button>
+            </nav>
+            <div class="files-actions">
+              <button id="gitButton" class="icon-button" type="button">Git</button>
+              <button id="fileOptionsButton" class="icon-button square-button" type="button" aria-expanded="false">View</button>
+              <button id="filesRefreshButton" class="icon-button" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="fileOptionsMenu" class="file-options" hidden>
+            <label>
+              <input id="showHiddenToggle" type="checkbox" />
+              Show dotfiles
+            </label>
+          </div>
+          <section id="projectWorkbench" class="project-workbench" hidden>
+            <div class="project-head">
+              <div>
+                <p class="toolbar-label">Project</p>
+                <h2 id="projectTitle">No project</h2>
+                <div id="projectMeta" class="project-meta"></div>
+              </div>
+              <button id="projectChatButton" class="icon-button project-chat-button" type="button">Chat</button>
+              <div class="branch-control">
+                <label for="branchSelect">Branch</label>
+                <select id="branchSelect"></select>
+                <div id="branchMeta" class="branch-meta"></div>
+              </div>
+            </div>
+            <nav class="project-tabs" aria-label="Project workbench">
+              <button class="project-tab active" type="button" data-project-tab="changes">Changes</button>
+              <button class="project-tab" type="button" data-project-tab="files">Files</button>
+              <button class="project-tab" type="button" data-project-tab="commits">Commits</button>
+            </nav>
+            <section id="projectPanel" class="project-panel" aria-live="polite"></section>
+          </section>
+          <nav id="fileBreadcrumbs" class="breadcrumbs" aria-label="File path"></nav>
+          <div id="fileRoot" class="file-root sr-only">/home/nicola-rota</div>
+          <section id="fileList" class="file-list" aria-live="polite"></section>
+        </div>
+        <div id="gitScreen" class="file-screen git-screen" hidden>
+          <div class="reader-toolbar">
+            <button id="gitBackButton" class="icon-button" type="button">Back</button>
+            <div class="reader-title">
+              <p class="toolbar-label">Repository</p>
+              <div id="gitMeta" class="file-preview-meta">No repository selected.</div>
+            </div>
+          </div>
+          <section id="gitContent" class="git-content" aria-live="polite"></section>
+        </div>
+        <div id="fileReaderScreen" class="file-screen file-reader-screen" hidden>
+          <div class="reader-toolbar">
+            <button id="fileBackButton" class="icon-button" type="button">Back</button>
+            <div class="reader-title">
+              <p class="toolbar-label">Read only</p>
+              <div id="filePreviewMeta" class="file-preview-meta">No file selected.</div>
+            </div>
+          </div>
+          <pre id="filePreviewContent" class="file-preview-content"></pre>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
