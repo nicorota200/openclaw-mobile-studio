@@ -554,37 +554,40 @@ async function getGitInfo(url) {
 }
 
 async function listProjects() {
-  const projectsDir = resolve(fileRoot, "projects");
-  const resolved = await resolveInsideFileRoot("projects");
-  if (!resolved.ok) return resolved;
-  let dirents;
-  try {
-    dirents = await readdir(projectsDir, { withFileTypes: true });
-  } catch {
-    return { ok: true, root: fileRoot, projects: [] };
-  }
+  const projectRoots = ["projects", ".openclaw/workspace/projects"];
   const projects = [];
-  for (const dirent of dirents) {
-    if (!dirent.isDirectory() || dirent.name.startsWith(".")) continue;
-    const absolutePath = join(projectsDir, dirent.name);
+
+  for (const rootPath of projectRoots) {
+    const resolved = await resolveInsideFileRoot(rootPath);
+    if (!resolved.ok) return resolved;
+    let dirents;
     try {
-      await stat(join(absolutePath, ".git"));
-      const status = await runCommand("git", ["-C", absolutePath, "status", "--short", "--branch"], { timeoutMs: 5000 }).catch(
-        () => "",
-      );
-      const lines = status ? status.split("\n") : [];
-      const header = parseStatusHeader(lines.find((line) => line.startsWith("##")) || "");
-      projects.push({
-        name: dirent.name,
-        path: `projects/${dirent.name}`,
-        branch: header.branch || "",
-        tracking: header.tracking,
-        ahead: header.ahead,
-        behind: header.behind,
-        changes: lines.filter((line) => !line.startsWith("##")).length,
-      });
+      dirents = await readdir(resolved.absolutePath, { withFileTypes: true });
     } catch {
-      // Ignore non-repositories.
+      continue;
+    }
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory() || dirent.name.startsWith(".")) continue;
+      const absolutePath = join(resolved.absolutePath, dirent.name);
+      try {
+        await stat(join(absolutePath, ".git"));
+        const status = await runCommand("git", ["-C", absolutePath, "status", "--short", "--branch"], { timeoutMs: 5000 }).catch(
+          () => "",
+        );
+        const lines = status ? status.split("\n") : [];
+        const header = parseStatusHeader(lines.find((line) => line.startsWith("##")) || "");
+        projects.push({
+          name: dirent.name,
+          path: `${rootPath}/${dirent.name}`,
+          branch: header.branch || "",
+          tracking: header.tracking,
+          ahead: header.ahead,
+          behind: header.behind,
+          changes: lines.filter((line) => !line.startsWith("##")).length,
+        });
+      } catch {
+        // Ignore non-repositories.
+      }
     }
   }
   projects.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));

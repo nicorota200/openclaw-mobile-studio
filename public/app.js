@@ -23,7 +23,9 @@ const state = {
   projectInfo: null,
   projectLoading: false,
   projectActionBusy: "",
+  projectCommitDrafts: {},
   projectTab: initialParams.get("tab") || localStorage.getItem("oms.projectTab") || "changes",
+  projectWorkbenchRenderPending: false,
   projectPollTimer: null,
   selectedProjectPath: localStorage.getItem("oms.selectedProjectPath") || "",
   chatProjectPath: "",
@@ -459,13 +461,21 @@ function parentPath(path) {
 }
 
 function isProjectsPath(path = state.filePath) {
-  return path === "projects" || path.startsWith("projects/");
+  return (
+    path === "projects" ||
+    path.startsWith("projects/") ||
+    path === ".openclaw/workspace/projects" ||
+    path.startsWith(".openclaw/workspace/projects/")
+  );
 }
 
 function projectPathFromFilePath(path = state.filePath) {
   const parts = String(path || "").split("/").filter(Boolean);
-  if (parts[0] !== "projects" || !parts[1]) return "";
-  return `projects/${parts[1]}`;
+  if (parts[0] === "projects" && parts[1]) return `projects/${parts[1]}`;
+  if (parts[0] === ".openclaw" && parts[1] === "workspace" && parts[2] === "projects" && parts[3]) {
+    return `.openclaw/workspace/projects/${parts[3]}`;
+  }
+  return "";
 }
 
 function fileIcon(type, isSymlink) {
@@ -1173,6 +1183,7 @@ function renderFileList() {
   renderProjectWorkbench();
   const projectMode = Boolean(projectPathFromFilePath());
   const showFileBrowser = !projectMode || state.projectTab === "files";
+  els.fileBrowserScreen.classList.toggle("project-detail-mode", projectMode && !showFileBrowser);
   els.fileBreadcrumbs.hidden = !showFileBrowser;
   els.fileList.hidden = !showFileBrowser;
   if (!showFileBrowser) return;
@@ -1322,6 +1333,26 @@ function gitActionState(info) {
   };
 }
 
+function projectCommitDraftKey(path = state.projectInfo?.repositoryPath || projectPathFromFilePath() || state.selectedProjectPath) {
+  return path ? `commit:${path}` : "";
+}
+
+function getProjectCommitDraft(path) {
+  const key = projectCommitDraftKey(path);
+  return key ? state.projectCommitDrafts[key] || "" : "";
+}
+
+function setProjectCommitDraft(path, message) {
+  const key = projectCommitDraftKey(path);
+  if (!key) return;
+  if (message) state.projectCommitDrafts[key] = message;
+  else delete state.projectCommitDrafts[key];
+}
+
+function isProjectCommitInputActive() {
+  return Boolean(document.activeElement?.matches?.(".project-commit-form textarea"));
+}
+
 function renderBranchControl() {
   const info = state.projectInfo;
   els.branchSelect.innerHTML = "";
@@ -1428,7 +1459,12 @@ function renderChatProjectStrip() {
   els.chatProjectStrip.append(list);
 }
 
-function renderProjectWorkbench() {
+function renderProjectWorkbench({ deferWhileComposing = false } = {}) {
+  if (deferWhileComposing && isProjectCommitInputActive()) {
+    state.projectWorkbenchRenderPending = true;
+    return;
+  }
+  state.projectWorkbenchRenderPending = false;
   const info = state.projectInfo;
   const activeProjectPath = projectPathFromFilePath();
   const showWorkbench = Boolean(activeProjectPath);
@@ -1568,6 +1604,7 @@ function renderProjectChanges() {
 
 function renderProjectGitActions(info) {
   const stateInfo = gitActionState(info);
+  const projectPath = info?.repositoryPath || projectPathFromFilePath() || state.selectedProjectPath;
   const panel = document.createElement("section");
   panel.className = "project-git-actions";
 
@@ -1606,6 +1643,14 @@ function renderProjectGitActions(info) {
   input.rows = 2;
   input.placeholder = "Commit message";
   input.disabled = Boolean(state.projectActionBusy);
+  input.value = getProjectCommitDraft(projectPath);
+  input.addEventListener("input", () => setProjectCommitDraft(projectPath, input.value));
+  input.addEventListener("blur", () => {
+    if (!state.projectWorkbenchRenderPending) return;
+    window.setTimeout(() => {
+      if (!isProjectCommitInputActive() && state.projectWorkbenchRenderPending) renderProjectWorkbench();
+    }, 0);
+  });
   const commit = document.createElement("button");
   commit.type = "submit";
   commit.textContent = "Commit";
@@ -1614,6 +1659,7 @@ function renderProjectGitActions(info) {
   form.append(input, commit);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
+    setProjectCommitDraft(projectPath, input.value);
     runProjectGitAction("commit", { message: input.value }).catch((error) => setStatus(error.message, "error"));
   });
   panel.append(form);
@@ -1980,7 +2026,7 @@ async function refreshSelectedProject({ quiet = true } = {}) {
     localStorage.setItem("oms.selectedProjectPath", state.selectedProjectPath);
   } finally {
     state.projectLoading = false;
-    renderProjectWorkbench();
+    renderProjectWorkbench({ deferWhileComposing: quiet && !state.projectActionBusy });
   }
 }
 
@@ -2119,6 +2165,7 @@ async function runProjectGitAction(action, options = {}) {
       method: "POST",
       body: JSON.stringify({ path, action, message }),
     });
+    if (action === "commit") setProjectCommitDraft(path, "");
     await refreshSelectedProject({ quiet: true });
     await refreshChatProject({ quiet: true }).catch(() => {});
     setStatus(result.message || `${gitActionLabel(action)} complete`, "ok");

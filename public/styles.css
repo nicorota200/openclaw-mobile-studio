@@ -1007,6 +1007,10 @@ h2 {
   grid-template-rows: auto auto 1fr;
 }
 
+#fileBrowserScreen.project-detail-mode {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .file-reader-screen {
   grid-template-rows: auto 1fr;
 }
@@ -1069,6 +1073,11 @@ h2 {
   min-height: 0;
   border-bottom: 1px solid rgba(44, 63, 78, 0.65);
   background: #101820;
+}
+
+#fileBrowserScreen.project-detail-mode .project-workbench {
+  grid-template-rows: auto auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .project-head {
@@ -1170,6 +1179,12 @@ h2 {
   max-height: min(48dvh, 460px);
   overflow-y: auto;
   padding: 0 12px 10px;
+}
+
+#fileBrowserScreen.project-detail-mode .project-panel {
+  max-height: none;
+  min-height: 0;
+  padding-bottom: calc(12px + env(safe-area-inset-bottom));
 }
 
 .project-summary {
@@ -1750,6 +1765,28 @@ h2 {
 }
 
 @media (max-width: 520px) {
+  .topbar {
+    gap: 8px;
+    padding-inline: 10px;
+  }
+
+  .icon-button {
+    min-width: 58px;
+    height: 34px;
+    padding-inline: 8px;
+  }
+
+  .square-button {
+    min-width: 48px;
+    width: 48px;
+  }
+
+  .status-strip {
+    min-height: 26px;
+    padding-block: 4px;
+    font-size: 12px;
+  }
+
   .home-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1760,6 +1797,8 @@ h2 {
 
   .files-toolbar {
     grid-template-columns: 1fr;
+    gap: 6px;
+    padding: 7px 10px;
   }
 
   .quick-links,
@@ -1779,5 +1818,121 @@ h2 {
   .files-actions .icon-button {
     min-width: 0;
     width: 100%;
+  }
+
+  .session-panel {
+    padding: 5px 10px;
+  }
+
+  .run-summary {
+    min-height: 38px;
+    padding: 5px 10px;
+  }
+
+  .run-status-button {
+    gap: 6px;
+  }
+
+  .run-detail-button,
+  .run-stop-button {
+    min-height: 28px;
+    padding-inline: 8px;
+  }
+
+  .message-list {
+    gap: 10px;
+    padding: 10px 12px;
+  }
+
+  .message {
+    max-width: 94%;
+    padding: 9px 10px;
+  }
+
+  .message.activity {
+    padding: 8px 9px;
+  }
+
+  .composer {
+    gap: 7px;
+    padding: 7px 10px calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .command-row {
+    min-height: 26px;
+  }
+
+  .command-toggle {
+    height: 26px;
+  }
+
+  .project-head {
+    gap: 7px;
+    padding: 9px 10px 7px;
+  }
+
+  .project-head h2 {
+    font-size: 17px;
+  }
+
+  .project-meta {
+    font-size: 11px;
+  }
+
+  #branchSelect {
+    min-height: 32px;
+  }
+
+  .branch-meta {
+    display: none;
+  }
+
+  .project-tabs {
+    gap: 6px;
+    padding: 0 10px 7px;
+  }
+
+  .project-tab {
+    min-height: 32px;
+  }
+
+  .project-panel {
+    gap: 7px;
+    padding-inline: 10px;
+  }
+
+  .project-summary div,
+  .project-action-launcher,
+  .project-git-actions {
+    padding: 8px;
+  }
+
+  .project-action-list,
+  .project-git-buttons {
+    gap: 6px;
+  }
+
+  .project-action-button {
+    min-height: 42px;
+    padding: 6px 8px;
+  }
+
+  .project-git-action-button,
+  .project-commit-form button {
+    min-height: 32px;
+  }
+
+  .project-commit-form textarea {
+    min-height: 38px;
+  }
+
+  .diff-preview {
+    max-height: 180px;
+  }
+
+  .file-row {
+    min-height: 44px;
+    padding-inline: 10px;
+    grid-template-columns: 48px minmax(0, 1fr) auto;
   }
 }

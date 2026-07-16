@@ -115,11 +115,26 @@ async function checkProjectGitActions(page, name) {
   await visibleBox(page, ".project-git-actions", `${name} git actions`);
   await visibleBox(page, ".project-commit-form", `${name} commit form`);
   await checkNoHorizontalOverflow(page, `${name} project git actions`);
+  const viewport = page.viewportSize();
+  const projectPanel = await page.locator("#projectPanel").boundingBox();
+  if (viewport?.width <= 520) {
+    assert(
+      projectPanel && projectPanel.y + projectPanel.height >= viewport.height - 24,
+      `${name} project panel leaves dead space below the workbench`,
+    );
+  }
 
   const buttons = await page.locator(".project-git-action-button").count();
   assert(buttons === 4, `${name} expected 4 Git action buttons, got ${buttons}`);
   const agentButtons = await page.locator(".project-action-button").count();
   assert(agentButtons === 5, `${name} expected 5 project action buttons, got ${agentButtons}`);
+  const textarea = page.locator(".project-commit-form textarea");
+  await textarea.fill("Draft commit message");
+  await textarea.focus();
+  await page.waitForTimeout(4500);
+  assert((await textarea.inputValue()) === "Draft commit message", `${name} commit message draft was lost during polling`);
+  const textareaStillFocused = await page.evaluate(() => document.activeElement?.matches(".project-commit-form textarea"));
+  assert(textareaStillFocused, `${name} commit message input lost focus during polling`);
 
   const title = (await page.locator("#viewTitle").textContent())?.trim();
   assert(title === "Files", `${name} expected Files title in project view, got "${title}"`);
@@ -129,6 +144,26 @@ async function checkProjectGitActions(page, name) {
     window.scrollTo(0, 0);
   });
   await page.screenshot({ path: new URL(`${name}-project-git.png`, artifactsDir).pathname, fullPage: true });
+}
+
+async function checkWorkspaceProjectWorkbench(page, name) {
+  const workspaceProjectPath = ".openclaw/workspace/projects/openclaw-mobile-studio";
+  const projects = await timedJson(page, "api/projects", 5000, `${name} projects API`);
+  assert(
+    projects.projects?.some((project) => project.path === workspaceProjectPath),
+    `${name} projects API did not include workspace project`,
+  );
+
+  await page.goto(`${baseUrl}?view=files&path=${encodeURIComponent(workspaceProjectPath)}&tab=changes`, {
+    waitUntil: "domcontentloaded",
+  });
+  await visibleBox(page, "#projectWorkbench", `${name} workspace project workbench`);
+  await visibleBox(page, ".project-action-launcher", `${name} workspace project action launcher`);
+  await visibleBox(page, ".project-git-actions", `${name} workspace project git actions`);
+  await checkNoHorizontalOverflow(page, `${name} workspace project`);
+
+  const title = (await page.locator("#projectTitle").textContent())?.trim();
+  assert(title === "openclaw-mobile-studio", `${name} expected workspace project title, got "${title}"`);
 }
 
 async function checkCachedSessionFirstPaint(browser) {
@@ -369,6 +404,7 @@ try {
     await checkChat(page, scenario.name);
     await checkFiles(page, scenario.name);
     await checkProjectGitActions(page, scenario.name);
+    await checkWorkspaceProjectWorkbench(page, scenario.name);
     await context.close();
   }
 } finally {
