@@ -7,11 +7,13 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 ## What It Does
 
 - Chat with existing OpenClaw sessions.
+- Manage Mobile Studio chat sessions from Settings.
 - See active run state and stop active runs.
 - Browse allowed files read-only.
 - Inspect Git projects, branches, commits, changes, and diffs.
 - Run guarded Git actions: pull, stage all, unstage, commit, and push.
 - Launch project-aware agent prompts such as review, explain diff, check, commit plan, and continue.
+- Attach Git projects to available chat sessions without stealing the currently selected chat.
 - Show a mobile Home/Inbox with active runs, changed projects, and recent audit activity.
 - Keep an append-only local audit log for Mobile Studio actions without storing raw prompt text.
 
@@ -64,6 +66,10 @@ MOBILE_STUDIO_TOKEN=
 MOBILE_STUDIO_FILE_ROOT=/home/your-user
 OPENCLAW_BIN=/path/to/openclaw
 OPENCLAW_SESSIONS_DIR=/path/to/.openclaw/agents/main/sessions
+MOBILE_STUDIO_UPLOAD_DIR=./data/chat-uploads
+MOBILE_STUDIO_MAX_UPLOAD_BYTES=1073741824
+MOBILE_STUDIO_UPLOAD_TTL_MS=604800000
+MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE=5
 ```
 
 `MOBILE_STUDIO_TOKEN` is optional. If set, API requests must use:
@@ -73,6 +79,26 @@ Authorization: Bearer <token>
 ```
 
 The service is intended to bind to loopback and sit behind a trusted private reverse proxy or VPN route.
+
+## Sessions And Project Chats
+
+Mobile Studio treats sessions as a finite pool. The Settings view is the management surface:
+
+- `New session` creates a local Mobile Studio session and adds it to the pool.
+- `Detach` clears the project binding from a session without deleting its history.
+- `Delete` removes the session from the active pool. Session files are moved to `data/deleted-sessions/` so the app no longer uses them, while manual recovery remains possible.
+
+Project `Chat` does not create sessions and does not use the currently selected session by accident. It follows this order:
+
+1. Open the session already attached to that project.
+2. Otherwise attach the project to the first session with no project binding.
+3. If every session is occupied, show an alert and leave the current view unchanged.
+
+Project bindings are stored server-side in `data/session-state.json`. The browser cache is only a startup accelerator.
+
+## Chat Attachments
+
+The composer can upload files before sending a message. Uploads are streamed to `MOBILE_STUDIO_UPLOAD_DIR`, defaulting to `data/chat-uploads/`, and the message sent to OpenClaw includes filesystem-readable paths plus metadata. Defaults are 1 GB per file, 5 attachments per message, and 7 days before cleanup.
 
 ## Tailscale Serve Example
 

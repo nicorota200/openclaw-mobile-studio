@@ -4,10 +4,13 @@ const initialParams = new URLSearchParams(window.location.search);
 
 const state = {
   activeView: initialParams.get("view") || localStorage.getItem("oms.activeView") || "home",
+  theme: localStorage.getItem("oms.theme") === "light" ? "light" : "dark",
   attention: null,
   attentionLoading: false,
   attentionPollTimer: null,
   sessions: [],
+  sessionsLoading: false,
+  sessionActionBusy: "",
   selectedSessionKey: localStorage.getItem("oms.selectedSessionKey") || "",
   selectedSession: null,
   messages: [],
@@ -38,6 +41,7 @@ const state = {
   loading: false,
   filesLoading: false,
   sending: false,
+  pendingAttachments: [],
   pollTimer: null,
   runPollTimer: null,
   historyPollInFlight: false,
@@ -124,6 +128,10 @@ const els = {
   homeProjectList: document.getElementById("homeProjectList"),
   homeAuditList: document.getElementById("homeAuditList"),
   homeActions: Array.from(document.querySelectorAll("[data-home-action]")),
+  settingsView: document.getElementById("settingsView"),
+  themeOptions: Array.from(document.querySelectorAll("[data-theme-choice]")),
+  createSessionButton: document.getElementById("createSessionButton"),
+  settingsSessionList: document.getElementById("settingsSessionList"),
   chatView: document.getElementById("chatView"),
   filesView: document.getElementById("filesView"),
   fileBrowserScreen: document.getElementById("fileBrowserScreen"),
@@ -140,6 +148,9 @@ const els = {
   commandButton: document.getElementById("commandButton"),
   commandHint: document.getElementById("commandHint"),
   commandPalette: document.getElementById("commandPalette"),
+  attachmentList: document.getElementById("attachmentList"),
+  fileInput: document.getElementById("fileInput"),
+  attachButton: document.getElementById("attachButton"),
   messageInput: document.getElementById("messageInput"),
   sendButton: document.getElementById("sendButton"),
   refreshButton: document.getElementById("refreshButton"),
@@ -214,16 +225,38 @@ function closeMenu() {
   els.sideMenu.setAttribute("aria-hidden", "true");
 }
 
+function applyTheme(theme = state.theme) {
+  state.theme = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = state.theme;
+  localStorage.setItem("oms.theme", state.theme);
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.content = state.theme === "light" ? "#ffffff" : "#05080d";
+  for (const option of els.themeOptions) {
+    const active = option.dataset.themeChoice === state.theme;
+    option.classList.toggle("active", active);
+    option.setAttribute("aria-pressed", String(active));
+  }
+}
+
 function setView(view) {
-  state.activeView = ["home", "chat", "files"].includes(view) ? view : "home";
+  state.activeView = ["home", "chat", "files", "settings"].includes(view) ? view : "home";
   localStorage.setItem("oms.activeView", state.activeView);
   els.homeView.hidden = state.activeView !== "home";
   els.chatView.hidden = state.activeView !== "chat";
   els.filesView.hidden = state.activeView !== "files";
+  els.settingsView.hidden = state.activeView !== "settings";
   els.homeView.classList.toggle("active-view", state.activeView === "home");
   els.chatView.classList.toggle("active-view", state.activeView === "chat");
   els.filesView.classList.toggle("active-view", state.activeView === "files");
-  els.viewTitle.textContent = state.activeView === "files" ? "Files" : state.activeView === "chat" ? "Mobile Studio" : "Home";
+  els.settingsView.classList.toggle("active-view", state.activeView === "settings");
+  els.viewTitle.textContent =
+    state.activeView === "files"
+      ? "Files"
+      : state.activeView === "chat"
+        ? "Mobile Studio"
+        : state.activeView === "settings"
+          ? "Settings"
+          : "Home";
   els.refreshButton.textContent = "Refresh";
   for (const item of els.navItems) item.classList.toggle("active", item.dataset.view === state.activeView);
   closeMenu();
@@ -237,6 +270,9 @@ function setView(view) {
     loadFiles().catch((error) => setStatus(error.message, "error"));
   }
   if (state.activeView === "files") startProjectPolling();
+  if (state.activeView === "settings") {
+    loadSessions().catch((error) => setStatus(error.message, "error"));
+  }
   if (state.activeView === "chat") {
     startChatPolling();
     startRunPolling();
@@ -275,6 +311,32 @@ function api(path, options = {}) {
       throw new Error(message);
     }
     return data;
+  });
+}
+
+function uploadAttachment(file, item) {
+  return new Promise((resolveUpload, rejectUpload) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append("file", file, file.name || "upload");
+    xhr.open("POST", appUrl("/api/uploads"));
+    xhr.responseType = "json";
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) return;
+      item.progress = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+      renderAttachments();
+    });
+    xhr.addEventListener("load", () => {
+      const data = xhr.response || {};
+      if (xhr.status < 200 || xhr.status >= 300 || data.ok === false) {
+        rejectUpload(new Error(data.error?.message || `Upload failed (${xhr.status})`));
+        return;
+      }
+      resolveUpload(data.attachment);
+    });
+    xhr.addEventListener("error", () => rejectUpload(new Error("Upload failed")));
+    xhr.addEventListener("abort", () => rejectUpload(new Error("Upload aborted")));
+    xhr.send(form);
   });
 }
 
@@ -389,6 +451,7 @@ function compactSessionForCache(session) {
     estimatedCostUsd: session.estimatedCostUsd ?? null,
     totalTokens: session.totalTokens ?? null,
     contextTokens: session.contextTokens ?? null,
+    projectPath: session.projectPath || "",
   };
 }
 
@@ -435,17 +498,53 @@ function chatProjectKey(sessionKey = state.selectedSessionKey) {
   return sessionKey ? `oms.chatProjectPath.${encodeURIComponent(sessionKey)}` : "";
 }
 
+function sessionByKey(sessionKey) {
+  return state.sessions.find((session) => session.key === sessionKey) || null;
+}
+
+function projectPathForSession(sessionKey = state.selectedSessionKey) {
+  const session = sessionByKey(sessionKey);
+  if (session && Object.prototype.hasOwnProperty.call(session, "projectPath")) return session.projectPath || "";
+  if (session?.projectPath) return session.projectPath;
+  const legacyKey = chatProjectKey(sessionKey);
+  return legacyKey ? localStorage.getItem(legacyKey) || "" : "";
+}
+
 function loadChatProjectAttachment() {
-  const key = chatProjectKey();
-  state.chatProjectPath = key ? localStorage.getItem(key) || "" : "";
+  state.chatProjectPath = projectPathForSession();
   state.chatProjectInfo = null;
   state.chatProjectExpanded = false;
   renderChatProjectStrip();
 }
 
-function clearChatProjectAttachment() {
+async function setSessionProjectPath(sessionKey, projectPath) {
+  const result = await api("/api/session-project", {
+    method: "POST",
+    body: JSON.stringify({ sessionKey, projectPath }),
+  });
+  const session = sessionByKey(sessionKey);
+  if (session) session.projectPath = result.projectPath || "";
+  const key = chatProjectKey(sessionKey);
+  if (key) {
+    if (result.projectPath) localStorage.setItem(key, result.projectPath);
+    else localStorage.removeItem(key);
+  }
+  if (sessionKey === state.selectedSessionKey) {
+    state.chatProjectPath = result.projectPath || "";
+    state.chatProjectInfo = null;
+    renderChatProjectStrip();
+  }
+  renderSessions();
+  renderSettingsSessions();
+  return result;
+}
+
+async function clearChatProjectAttachment() {
   const key = chatProjectKey();
   if (key) localStorage.removeItem(key);
+  if (state.selectedSessionKey && state.selectedSession?.projectPath) {
+    await setSessionProjectPath(state.selectedSessionKey, "");
+  }
   state.chatProjectPath = "";
   state.chatProjectInfo = null;
   state.chatProjectExpanded = false;
@@ -478,28 +577,72 @@ function projectPathFromFilePath(path = state.filePath) {
   return "";
 }
 
-function fileIcon(type, isSymlink) {
-  if (isSymlink) return "Link";
+function fileIcon(type) {
   if (type === "directory") return "Dir";
   if (type === "file") return "File";
   return "Item";
 }
 
-function textFromContent(content) {
+function rawTextFromContent(content, depth = 0) {
+  if (depth > 4) return "";
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
       .map((item) => {
         if (typeof item === "string") return item;
+        if (item?.type === "toolCall" || item?.type === "toolResult") return "";
         if (item?.type === "text" && typeof item.text === "string") return item.text;
         if (typeof item?.text === "string") return item.text;
+        if (typeof item?.content === "string") return item.content;
+        if (typeof item?.output === "string") return item.output;
+        if (Array.isArray(item?.content)) return rawTextFromContent(item.content, depth + 1);
         return "";
       })
       .filter(Boolean)
       .join("\n");
   }
   if (typeof content?.text === "string") return content.text;
+  if (typeof content?.content === "string") return content.content;
+  if (typeof content?.output === "string") return content.output;
+  if (Array.isArray(content?.content)) return rawTextFromContent(content.content, depth + 1);
   return "";
+}
+
+function normalizeMessageText(value) {
+  let text = String(value || "").replace(/\r\n?/g, "\n").trim();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if ((text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"))) {
+      try {
+        const parsed = JSON.parse(text);
+        const extracted = rawTextFromContent(parsed, 1).trim();
+        if (extracted && extracted !== text) {
+          text = extracted;
+          continue;
+        }
+      } catch {
+        // Keep the original text when it only looks like JSON.
+      }
+    }
+
+    const fence = text.match(/^(```|''')([A-Za-z0-9_-]+)?[ \t]*\n([\s\S]*?)\n\1$/);
+    const lang = fence?.[2]?.toLowerCase() || "";
+    if (fence && (!lang || ["text", "plain", "markdown", "md"].includes(lang))) {
+      text = fence[3].trim();
+      continue;
+    }
+
+    const looseTextFence = text.match(/^(```|''')text[ \t]*\n?([\s\S]*)$/i);
+    if (looseTextFence) {
+      text = looseTextFence[2].replace(/(```|''')\s*$/g, "").trim();
+      continue;
+    }
+    break;
+  }
+  return text;
+}
+
+function textFromContent(content) {
+  return normalizeMessageText(rawTextFromContent(content));
 }
 
 function firstToolCallFromContent(content) {
@@ -608,6 +751,23 @@ function visibleMessagesWithPending() {
   return [...state.messages, ...pending];
 }
 
+function sortMessagesChronologically(messages) {
+  return messages
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const leftSeq = messageSeq(left.message);
+      const rightSeq = messageSeq(right.message);
+      if (leftSeq !== null && rightSeq !== null && leftSeq !== rightSeq) return leftSeq - rightSeq;
+
+      const leftTime = messageTimeMs(left.message);
+      const rightTime = messageTimeMs(right.message);
+      if (leftTime > 0 && rightTime > 0 && leftTime !== rightTime) return leftTime - rightTime;
+
+      return left.index - right.index;
+    })
+    .map((item) => item.message);
+}
+
 function shouldDropDuplicateTextMessage(previous, current) {
   if (!previous || !current) return false;
   if (isToolMessage(previous) || isToolMessage(current)) return false;
@@ -643,7 +803,7 @@ function resultExitSuffix(message) {
 }
 
 function buildVisibleMessages(messages) {
-  messages = dedupeMessages(messages);
+  messages = dedupeMessages(sortMessagesChronologically(messages));
   let latestUserTextIndex = -1;
   messages.forEach((message, index) => {
     if (!isToolMessage(message) && message.role === "user" && messageText(message)) latestUserTextIndex = index;
@@ -722,7 +882,7 @@ function renderSessions() {
   for (const session of state.sessions) {
     const option = document.createElement("option");
     option.value = session.key;
-    option.textContent = displayNameForSession(session);
+    option.textContent = session.projectPath ? `${displayNameForSession(session)} · ${session.projectPath.split("/").at(-1)}` : displayNameForSession(session);
     els.sessionSelect.append(option);
   }
   if (!state.sessions.some((session) => session.key === state.selectedSessionKey)) {
@@ -738,6 +898,7 @@ function renderSessions() {
   state.selectedSession = state.sessions.find((session) => session.key === state.selectedSessionKey) || null;
   loadChatProjectAttachment();
   renderSessionMeta();
+  renderSettingsSessions();
 }
 
 function renderSessionMeta(sessionInfo) {
@@ -751,9 +912,68 @@ function renderSessionMeta(sessionInfo) {
     session.runtime ? `runtime ${session.runtime}` : null,
     session.model ? session.model : null,
     session.status ? `status ${session.status}` : null,
+    session.projectPath ? `project ${session.projectPath.split("/").at(-1)}` : null,
     sessionInfo?.status && sessionInfo.status !== session.status ? `status ${sessionInfo.status}` : null,
   ].filter(Boolean);
   els.sessionMeta.textContent = bits.join(" · ");
+}
+
+function renderSettingsSessions() {
+  if (!els.settingsSessionList) return;
+  els.settingsSessionList.innerHTML = "";
+  if (state.sessionsLoading && state.sessions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "settings-session-empty";
+    empty.textContent = "Loading sessions...";
+    els.settingsSessionList.append(empty);
+    return;
+  }
+  if (state.sessions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "settings-session-empty";
+    empty.textContent = "No sessions available.";
+    els.settingsSessionList.append(empty);
+    return;
+  }
+  for (const session of state.sessions) {
+    const row = document.createElement("article");
+    row.className = "settings-session-row";
+    row.dataset.sessionKey = session.key;
+
+    const main = document.createElement("div");
+    main.className = "settings-session-main";
+    const title = document.createElement("strong");
+    title.textContent = displayNameForSession(session);
+    const meta = document.createElement("span");
+    meta.textContent = [
+      session.projectPath ? `Project: ${session.projectPath}` : "Free",
+      runStatusLabel(session),
+      session.hasLocalHistory ? "history" : "empty",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    main.append(title, meta);
+
+    const actions = document.createElement("div");
+    actions.className = "settings-session-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.dataset.sessionAction = "open";
+    open.textContent = "Open";
+    const detach = document.createElement("button");
+    detach.type = "button";
+    detach.dataset.sessionAction = "detach";
+    detach.textContent = "Detach";
+    detach.disabled = !session.projectPath || Boolean(state.sessionActionBusy);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.dataset.sessionAction = "delete";
+    remove.textContent = "Delete";
+    remove.disabled = isActiveRunSession(session) || Boolean(state.sessionActionBusy);
+    actions.append(open, detach, remove);
+    row.append(main, actions);
+    els.settingsSessionList.append(row);
+  }
 }
 
 function isActiveRunSession(session) {
@@ -1088,6 +1308,110 @@ function visibleMessageSignature(visibleMessages) {
   return [state.selectedSessionKey, state.loading ? "loading" : "ready", parts.join("\u001e")].join("\u001d");
 }
 
+function appendInlineFormatted(parent, text) {
+  const pattern = /(`[^`\n]+`|https?:\/\/[^\s<>()]+|\*\*[^*\n]+?\*\*)/g;
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > lastIndex) parent.append(document.createTextNode(text.slice(lastIndex, match.index)));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      parent.append(code);
+    } else if (token.startsWith("**")) {
+      const strong = document.createElement("strong");
+      appendInlineFormatted(strong, token.slice(2, -2));
+      parent.append(strong);
+    } else {
+      const link = document.createElement("a");
+      link.href = token;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = token;
+      parent.append(link);
+    }
+    lastIndex = match.index + token.length;
+  }
+  if (lastIndex < text.length) parent.append(document.createTextNode(text.slice(lastIndex)));
+}
+
+function appendMessageParagraph(container, lines) {
+  const paragraph = document.createElement("p");
+  lines.forEach((line, index) => {
+    if (index > 0) paragraph.append(document.createElement("br"));
+    appendInlineFormatted(paragraph, line);
+  });
+  container.append(paragraph);
+}
+
+function appendMessageList(container, lines, ordered) {
+  const list = document.createElement(ordered ? "ol" : "ul");
+  for (const line of lines) {
+    const item = document.createElement("li");
+    appendInlineFormatted(item, line.replace(ordered ? /^\d+[.)]\s+/ : /^[-*]\s+/, ""));
+    list.append(item);
+  }
+  container.append(list);
+}
+
+function appendMessageTextBlock(container, text) {
+  const blocks = text.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  for (const block of blocks) {
+    const lines = block.split("\n").map((line) => line.trimEnd());
+    if (lines.every((line) => /^[-*]\s+/.test(line))) {
+      appendMessageList(container, lines, false);
+    } else if (lines.every((line) => /^\d+[.)]\s+/.test(line))) {
+      appendMessageList(container, lines, true);
+    } else {
+      appendMessageParagraph(container, lines);
+    }
+  }
+}
+
+function renderMessageContent(container, text) {
+  container.innerHTML = "";
+  const lines = String(text || "").split("\n");
+  let buffer = [];
+  let fence = null;
+  let codeLines = [];
+
+  const flushText = () => {
+    if (!buffer.length) return;
+    appendMessageTextBlock(container, buffer.join("\n"));
+    buffer = [];
+  };
+
+  const flushCode = () => {
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.textContent = codeLines.join("\n");
+    pre.append(code);
+    container.append(pre);
+    codeLines = [];
+  };
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^(```|''')([A-Za-z0-9_-]+)?\s*$/);
+    if (fenceMatch) {
+      if (fence === fenceMatch[1]) {
+        flushCode();
+        fence = null;
+      } else if (!fence) {
+        flushText();
+        fence = fenceMatch[1];
+        codeLines = [];
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+    if (fence) codeLines.push(line);
+    else buffer.push(line);
+  }
+  if (fence && codeLines.length) buffer.push(codeLines.join("\n"));
+  flushText();
+}
+
 function renderMessages({ force = false } = {}) {
   const visibleMessages = buildVisibleMessages(visibleMessagesWithPending());
   const signature = visibleMessageSignature(visibleMessages);
@@ -1124,7 +1448,7 @@ function renderMessages({ force = false } = {}) {
 
     const contentEl = document.createElement("div");
     contentEl.className = "message-content";
-    contentEl.textContent = text;
+    renderMessageContent(contentEl, text);
 
     const timeEl = document.createElement("div");
     timeEl.className = "message-time";
@@ -1221,7 +1545,7 @@ function renderFileList() {
 
     const kind = document.createElement("span");
     kind.className = "file-row-kind";
-    kind.textContent = fileIcon(entry.type, entry.isSymlink);
+    kind.textContent = fileIcon(entry.type);
 
     const name = document.createElement("span");
     name.className = "file-row-name";
@@ -1673,6 +1997,128 @@ function renderProjectGitActions(info) {
   return panel;
 }
 
+function commitIdentity(commit) {
+  return commit?.fullHash || commit?.hash || "";
+}
+
+function buildCommitGraphRows(commits) {
+  let lanes = [];
+  const rows = [];
+  let maxLanes = 1;
+
+  for (const commit of commits) {
+    const id = commitIdentity(commit);
+    if (!id) continue;
+
+    let laneIndex = lanes.indexOf(id);
+    if (laneIndex === -1) {
+      laneIndex = lanes.findIndex((lane) => !lane);
+      if (laneIndex === -1) {
+        laneIndex = lanes.length;
+        lanes.push(id);
+      } else {
+        lanes[laneIndex] = id;
+      }
+    }
+
+    const before = lanes.slice();
+    const parents = Array.isArray(commit.parents) ? commit.parents.filter(Boolean) : [];
+    let after = lanes.slice();
+    if (parents.length > 0) {
+      after[laneIndex] = parents[0];
+      for (const parent of parents.slice(1).reverse()) {
+        if (!after.includes(parent)) after.splice(laneIndex + 1, 0, parent);
+      }
+    } else {
+      after.splice(laneIndex, 1);
+    }
+    after = after.filter(Boolean);
+
+    maxLanes = Math.max(maxLanes, before.length, after.length, laneIndex + 1);
+    rows.push({ commit, before, after, laneIndex, parents });
+    lanes = after;
+  }
+
+  return { rows, maxLanes: Math.max(maxLanes, 1) };
+}
+
+function appendGraphLine(svg, fromLane, fromY, toLane, toY, laneClass) {
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line.setAttribute("x1", String(10 + fromLane * 18));
+  line.setAttribute("y1", String(fromY));
+  line.setAttribute("x2", String(10 + toLane * 18));
+  line.setAttribute("y2", String(toY));
+  line.setAttribute("class", `commit-graph-line commit-graph-lane-${laneClass % 6}`);
+  svg.append(line);
+}
+
+function renderCommitGraph(commits) {
+  const { rows, maxLanes } = buildCommitGraphRows(commits);
+  const card = document.createElement("section");
+  card.className = "commit-graph-card";
+  card.setAttribute("aria-label", "Commit graph");
+
+  const head = document.createElement("div");
+  head.className = "commit-graph-head";
+  const title = document.createElement("strong");
+  title.textContent = "Mini graph";
+  const meta = document.createElement("span");
+  meta.textContent = `${rows.length} commits`;
+  head.append(title, meta);
+  card.append(head);
+
+  const viewport = document.createElement("div");
+  viewport.className = "commit-graph-viewport";
+
+  for (const row of rows) {
+    const line = document.createElement("article");
+    line.className = "commit-graph-row";
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "commit-graph-svg");
+    svg.setAttribute("viewBox", `0 0 ${Math.max(30, maxLanes * 18 + 10)} 42`);
+    svg.setAttribute("aria-hidden", "true");
+
+    row.before.forEach((lane, index) => {
+      if (index === row.laneIndex) {
+        appendGraphLine(svg, index, 0, index, 21, index);
+        return;
+      }
+      const nextIndex = row.after.indexOf(lane);
+      if (nextIndex !== -1) appendGraphLine(svg, index, 0, nextIndex, 42, index);
+    });
+
+    if (row.parents.length === 0) {
+      appendGraphLine(svg, row.laneIndex, 21, row.laneIndex, 42, row.laneIndex);
+    } else {
+      row.parents.forEach((parent, index) => {
+        const parentLane = Math.max(0, row.after.indexOf(parent));
+        appendGraphLine(svg, row.laneIndex, 21, parentLane, 42, row.laneIndex + index);
+      });
+    }
+
+    const node = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    node.setAttribute("cx", String(10 + row.laneIndex * 18));
+    node.setAttribute("cy", "21");
+    node.setAttribute("r", row.parents.length > 1 ? "5.4" : "4.8");
+    node.setAttribute("class", `commit-graph-node commit-graph-lane-${row.laneIndex % 6}`);
+    svg.append(node);
+
+    const detail = document.createElement("div");
+    detail.className = "commit-graph-detail";
+    const subject = document.createElement("strong");
+    subject.textContent = row.commit.subject || "(no subject)";
+    const metaLine = document.createElement("span");
+    metaLine.textContent = [row.commit.hash, row.commit.refs || row.commit.date].filter(Boolean).join(" · ");
+    detail.append(subject, metaLine);
+    line.append(svg, detail);
+    viewport.append(line);
+  }
+
+  card.append(viewport);
+  return card;
+}
+
 function renderProjectCommits() {
   const commits = state.projectInfo?.commits || [];
   els.projectPanel.innerHTML = "";
@@ -1693,6 +2139,7 @@ function renderProjectCommits() {
     list.append(row);
   }
   els.projectPanel.append(list);
+  els.projectPanel.append(renderCommitGraph(commits));
 }
 
 function setProjectTab(tab) {
@@ -1874,12 +2321,19 @@ async function loadAttention({ quiet = false } = {}) {
 }
 
 async function loadSessions() {
-  const data = await api("/api/sessions");
-  state.sessions = data.sessions || [];
-  cacheSessions(state.sessions);
-  renderSessions();
-  renderRunPanel();
-  hydrateCachedMessages();
+  state.sessionsLoading = true;
+  renderSettingsSessions();
+  try {
+    const data = await api("/api/sessions");
+    state.sessions = data.sessions || [];
+    cacheSessions(state.sessions);
+    renderSessions();
+    renderRunPanel();
+    hydrateCachedMessages();
+  } finally {
+    state.sessionsLoading = false;
+    renderSettingsSessions();
+  }
 }
 
 async function refreshRunState({ quiet = true } = {}) {
@@ -1956,7 +2410,7 @@ async function refreshAll({ quiet = false } = {}) {
       await loadProjectForCurrentPath({ quiet: true });
       startProjectPolling();
       setStatus(state.filePath || "home", "ok");
-    } else {
+    } else if (state.activeView === "chat") {
       if (!quiet) setStatus("Connecting...");
       if (!quiet) hydrateCachedSessions();
       if (!quiet) hydrateCachedMessages();
@@ -1967,6 +2421,9 @@ async function refreshAll({ quiet = false } = {}) {
       startChatPolling();
       startRunPolling();
       setStatus("Connected to OpenClaw Gateway", "ok");
+    } else if (state.activeView === "settings") {
+      await loadSessions();
+      setStatus("Settings ready", "ok");
     }
   } catch (error) {
     state.loading = false;
@@ -2056,6 +2513,20 @@ async function refreshChatProject({ quiet = true } = {}) {
 async function attachCurrentProjectToChat() {
   const path = state.projectInfo?.repositoryPath || projectPathFromFilePath();
   if (!path) return;
+  await loadSessions().catch(() => {});
+  const existing = state.sessions.find((session) => session.projectPath === path);
+  const target = existing || state.sessions.find((session) => !session.projectPath);
+  if (!target) {
+    window.alert("Tutte le sessioni sono occupate. Libera una sessione nei Settings prima di aprire questo progetto in chat.");
+    setStatus("No free chat session for this project.", "error");
+    return;
+  }
+  state.selectedSessionKey = target.key;
+  localStorage.setItem("oms.selectedSessionKey", target.key);
+  state.selectedSession = target;
+  if (!existing) {
+    await setSessionProjectPath(target.key, path);
+  }
   state.chatProjectPath = path;
   const key = chatProjectKey();
   if (key) localStorage.setItem(key, path);
@@ -2070,18 +2541,12 @@ async function attachCurrentProjectToChat() {
 async function sendProjectAction(action, info = state.projectInfo) {
   const path = info?.repositoryPath || projectPathFromFilePath();
   if (!path) return;
-  if (!state.selectedSessionKey) {
-    setStatus("Select a chat session before sending a project action.", "error");
-    return;
-  }
   const confirmKey = `project-action:${path}:${action}`;
   if (!consumeConfirmation(confirmKey, `Tap ${projectActionLabel(action)} again to send it to OpenClaw.`)) return;
-  state.chatProjectPath = path;
-  const key = chatProjectKey();
-  if (key) localStorage.setItem(key, path);
+  await attachCurrentProjectToChat();
+  if (state.chatProjectPath !== path || !state.selectedSessionKey) return;
   state.chatProjectInfo = info?.repositoryPath === path ? info : null;
   state.chatProjectExpanded = true;
-  setView("chat");
   await refreshChatProject({ quiet: true }).catch(() => {});
   await sendMessage(
     projectActionPrompt(action, {
@@ -2250,16 +2715,98 @@ async function openProjectFile(path) {
   });
 }
 
+function attachmentStatusText(item) {
+  if (item.status === "uploaded") return `${formatBytes(item.size)} · ready`;
+  if (item.status === "failed") return item.error || "upload failed";
+  return `${formatBytes(item.size)} · ${item.progress || 0}%`;
+}
+
+function renderAttachments() {
+  els.attachmentList.innerHTML = "";
+  els.attachmentList.hidden = state.pendingAttachments.length === 0;
+  for (const item of state.pendingAttachments) {
+    const row = document.createElement("div");
+    row.className = `attachment-chip attachment-${item.status}`;
+    const main = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = item.name;
+    const meta = document.createElement("small");
+    meta.textContent = attachmentStatusText(item);
+    main.append(name, meta);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", () => {
+      state.pendingAttachments = state.pendingAttachments.filter((attachment) => attachment.localId !== item.localId);
+      renderAttachments();
+    });
+    row.append(main, remove);
+    els.attachmentList.append(row);
+  }
+}
+
+async function addAttachmentFiles(files) {
+  const selected = Array.from(files || []).slice(0, 5);
+  if (selected.length === 0) return;
+  for (const file of selected) {
+    const item = {
+      localId: crypto.randomUUID(),
+      name: file.name || "upload",
+      size: file.size,
+      type: file.type || "application/octet-stream",
+      status: "uploading",
+      progress: 0,
+      attachment: null,
+      error: "",
+    };
+    state.pendingAttachments.push(item);
+    renderAttachments();
+    uploadAttachment(file, item)
+      .then((attachment) => {
+        item.status = "uploaded";
+        item.progress = 100;
+        item.attachment = attachment;
+        item.name = attachment.name || item.name;
+        item.size = attachment.size || item.size;
+        renderAttachments();
+      })
+      .catch((error) => {
+        item.status = "failed";
+        item.error = error.message || "upload failed";
+        renderAttachments();
+      });
+  }
+}
+
+function readyAttachments() {
+  return state.pendingAttachments.filter((item) => item.status === "uploaded" && item.attachment).map((item) => item.attachment);
+}
+
+function hasUploadingAttachments() {
+  return state.pendingAttachments.some((item) => item.status === "uploading");
+}
+
+function attachmentSummaryText(attachments) {
+  if (!attachments.length) return "";
+  return [
+    "",
+    "",
+    "Allegati:",
+    ...attachments.map((attachment) => `- ${attachment.name} (${formatBytes(attachment.size)})`),
+  ].join("\n");
+}
+
 async function sendMessage(message, options = {}) {
   const command = message.trim().split(/\s+/)[0]?.toLowerCase() || "";
+  const attachments = readyAttachments();
   const sessionKey = state.selectedSessionKey;
   const isNewCommand = command === "/new";
-  if (command === "/new") clearChatProjectAttachment();
+  if (command === "/new") await clearChatProjectAttachment();
   state.sending = true;
   els.sendButton.disabled = true;
   const localMessage = {
     role: "user",
-    content: message,
+    content: `${message || "Allegati caricati."}${attachmentSummaryText(attachments)}`,
     sessionKey,
     timestamp: Date.now(),
     pendingStatus: "sending",
@@ -2278,6 +2825,7 @@ async function sendMessage(message, options = {}) {
         sessionId: state.selectedSession?.sessionId || undefined,
         agentId: state.selectedSession?.agentId || undefined,
         message,
+        attachments: attachments.map((attachment) => ({ id: attachment.id })),
         idempotencyKey,
         audit: options.audit || undefined,
       }),
@@ -2296,6 +2844,8 @@ async function sendMessage(message, options = {}) {
     } else {
       setStatus("Message accepted by Gateway", "ok");
     }
+    state.pendingAttachments = [];
+    renderAttachments();
     await refreshRunState({ quiet: true }).catch(() => {});
     if (state.selectedSessionKey === sessionKey) await loadHistory({ quiet: true });
     startChatPolling();
@@ -2308,6 +2858,86 @@ async function sendMessage(message, options = {}) {
     state.sending = false;
     els.sendButton.disabled = false;
     els.messageInput.focus();
+  }
+}
+
+async function createSessionFromSettings() {
+  if (state.sessionActionBusy) return;
+  state.sessionActionBusy = "create";
+  renderSettingsSessions();
+  setStatus("Creating session...");
+  try {
+    const result = await api("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadSessions();
+    if (result.session?.key) {
+      state.selectedSessionKey = result.session.key;
+      localStorage.setItem("oms.selectedSessionKey", result.session.key);
+      state.selectedSession = sessionByKey(result.session.key);
+    }
+    renderSessions();
+    setStatus("Session created", "ok");
+  } finally {
+    state.sessionActionBusy = "";
+    renderSettingsSessions();
+  }
+}
+
+async function openSettingsSession(sessionKey) {
+  if (!sessionKey) return;
+  state.selectedSessionKey = sessionKey;
+  localStorage.setItem("oms.selectedSessionKey", sessionKey);
+  state.selectedSession = sessionByKey(sessionKey);
+  loadChatProjectAttachment();
+  setView("chat");
+  await refreshRunState({ quiet: true }).catch(() => {});
+  await loadHistory({ quiet: true }).catch(() => {});
+  await refreshChatProject({ quiet: true }).catch(() => {});
+}
+
+async function detachSettingsSession(sessionKey) {
+  if (!sessionKey || state.sessionActionBusy) return;
+  state.sessionActionBusy = `detach:${sessionKey}`;
+  renderSettingsSessions();
+  try {
+    await setSessionProjectPath(sessionKey, "");
+    await loadSessions();
+    setStatus("Project detached from session", "ok");
+  } finally {
+    state.sessionActionBusy = "";
+    renderSettingsSessions();
+  }
+}
+
+async function deleteSettingsSession(sessionKey) {
+  const session = sessionByKey(sessionKey);
+  if (!session || state.sessionActionBusy) return;
+  const ok = window.confirm(
+    `Delete "${displayNameForSession(session)}"?\n\nThis removes the session from Mobile Studio and its history will no longer be available here.`,
+  );
+  if (!ok) return;
+  state.sessionActionBusy = `delete:${sessionKey}`;
+  renderSettingsSessions();
+  try {
+    await api("/api/sessions", {
+      method: "DELETE",
+      body: JSON.stringify({ sessionKey }),
+    });
+    if (state.selectedSessionKey === sessionKey) {
+      state.selectedSessionKey = "";
+      state.selectedSession = null;
+      localStorage.removeItem("oms.selectedSessionKey");
+      state.messages = [];
+      state.pendingMessages = [];
+      state.messageRenderSignature = "";
+    }
+    await loadSessions();
+    setStatus("Session deleted", "ok");
+  } finally {
+    state.sessionActionBusy = "";
+    renderSettingsSessions();
   }
 }
 
@@ -2515,6 +3145,10 @@ els.filesRefreshButton.addEventListener("click", () => loadFiles().catch((error)
 
 els.gitButton.addEventListener("click", openGit);
 
+els.projectsShortcut.addEventListener("click", () => navigateFiles("projects"));
+
+els.workspaceShortcut.addEventListener("click", () => navigateFiles(".openclaw/workspace"));
+
 els.projectChatButton.addEventListener("click", () => {
   attachCurrentProjectToChat().catch((error) => setStatus(error.message, "error"));
 });
@@ -2529,10 +3163,6 @@ els.branchSelect.addEventListener("change", () => {
     renderBranchControl();
   });
 });
-
-els.projectsShortcut.addEventListener("click", () => navigateFiles("projects"));
-
-els.workspaceShortcut.addEventListener("click", () => navigateFiles(".openclaw/workspace"));
 
 els.fileOptionsButton.addEventListener("click", () => {
   const isHidden = els.fileOptionsMenu.hidden;
@@ -2565,6 +3195,32 @@ for (const item of els.navItems) {
   item.addEventListener("click", () => setView(item.dataset.view));
 }
 
+for (const option of els.themeOptions) {
+  option.addEventListener("click", () => applyTheme(option.dataset.themeChoice));
+}
+
+els.createSessionButton.addEventListener("click", () => {
+  createSessionFromSettings().catch((error) => {
+    state.sessionActionBusy = "";
+    renderSettingsSessions();
+    setStatus(error.message, "error");
+  });
+});
+
+els.settingsSessionList.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-session-action]");
+  if (!button) return;
+  const sessionKey = button.closest("[data-session-key]")?.dataset.sessionKey || "";
+  const action = button.dataset.sessionAction;
+  if (action === "open") {
+    openSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
+  } else if (action === "detach") {
+    detachSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
+  } else if (action === "delete") {
+    deleteSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
+  }
+});
+
 window.addEventListener("popstate", () => {
   if (state.activeView === "files" && state.fileScreen === "reader") {
     closeFileReader({ fromHistory: true });
@@ -2580,6 +3236,13 @@ els.commandPalette.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-command]");
   if (!button) return;
   insertCommand(button.dataset.command || "");
+});
+
+els.attachButton.addEventListener("click", () => els.fileInput.click());
+
+els.fileInput.addEventListener("change", async () => {
+  await addAttachmentFiles(els.fileInput.files).catch((error) => setStatus(error.message, "error"));
+  els.fileInput.value = "";
 });
 
 document.addEventListener("click", (event) => {
@@ -2614,7 +3277,18 @@ els.messageInput.addEventListener("keydown", (event) => {
 els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const message = els.messageInput.value.trim();
-  if (!message || state.sending || !state.selectedSessionKey) return;
+  const attachments = readyAttachments();
+  const hasFailedAttachments = state.pendingAttachments.some((item) => item.status === "failed");
+  if (state.sending || !state.selectedSessionKey) return;
+  if (hasUploadingAttachments()) {
+    setStatus("Wait for attachments to finish uploading.", "error");
+    return;
+  }
+  if (hasFailedAttachments) {
+    setStatus("Remove failed attachments before sending.", "error");
+    return;
+  }
+  if (!message && attachments.length === 0) return;
   const command = message.split(/\s+/)[0]?.toLowerCase() || "";
   if (riskySlashCommands.has(command)) {
     const key = `slash-command:${state.selectedSessionKey}:${message}`;
@@ -2632,7 +3306,8 @@ els.composer.addEventListener("submit", async (event) => {
   }
 });
 
-setView(["home", "chat", "files"].includes(state.activeView) ? state.activeView : "home");
+applyTheme();
+setView(["home", "chat", "files", "settings"].includes(state.activeView) ? state.activeView : "home");
 setFileScreen("browser");
 updateFileControls();
 refreshAll();

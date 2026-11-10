@@ -1,15 +1,20 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, normalize, relative, resolve, sep } from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import Busboy from "busboy";
 import { readAuditEvents, writeAuditEventQuiet } from "./lib/audit.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "public");
 const dataDir = resolve(__dirname, "data");
 const auditLogPath = join(dataDir, "audit-log.jsonl");
+const appSessionStatePath = join(dataDir, "session-state.json");
+const deletedSessionsDir = join(dataDir, "deleted-sessions");
 
 const host = process.env.HOST || "127.0.0.1";
 const port = Number.parseInt(process.env.PORT || "8787", 10);
@@ -23,6 +28,11 @@ const maxChars = 4000;
 const fileRoot = resolve(process.env.MOBILE_STUDIO_FILE_ROOT || "/home/nicola-rota");
 const filePreviewLimit = 200 * 1024;
 const diffPreviewLimit = 80_000;
+const uploadRoot = resolve(process.env.MOBILE_STUDIO_UPLOAD_DIR || join(dataDir, "chat-uploads"));
+const uploadMaxFileBytes = Number.parseInt(process.env.MOBILE_STUDIO_MAX_UPLOAD_BYTES || "", 10) || 1024 * 1024 * 1024;
+const uploadTtlMs = Number.parseInt(process.env.MOBILE_STUDIO_UPLOAD_TTL_MS || "", 10) || 7 * 24 * 60 * 60 * 1000;
+const uploadMaxAttachmentsPerMessage =
+  Number.parseInt(process.env.MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE || "", 10) || 5;
 const mountPrefixes = ["/mobile-studio"];
 
 const mimeTypes = new Map([
@@ -110,6 +120,147 @@ async function readJson(req) {
   const raw = await readBody(req);
   if (!raw.trim()) return {};
   return JSON.parse(raw);
+}
+
+class HttpError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function safeUploadName(name) {
+  const base = basename(String(name || "upload").replace(/\0/g, ""));
+  const cleaned = base.replace(/[^\w .@()+,-]/g, "_").replace(/\s+/g, " ").trim();
+  return cleaned.slice(0, 180) || "upload";
+}
+
+function uploadMetaPath(id) {
+  return join(uploadRoot, id, "manifest.json");
+}
+
+async function readUploadManifest(id) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(id || ""))) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_ID", "Attachment id is invalid.");
+  }
+  const manifest = JSON.parse(await readFile(uploadMetaPath(id), "utf8"));
+  const filePath = resolve(manifest.path || "");
+  const uploadDir = resolve(uploadRoot, id);
+  if (filePath !== uploadDir && !filePath.startsWith(`${uploadDir}${sep}`)) {
+    throw new HttpError(403, "INVALID_ATTACHMENT_PATH", "Attachment path is outside its upload directory.");
+  }
+  await stat(filePath);
+  return manifest;
+}
+
+async function cleanupExpiredUploadsQuiet() {
+  const now = Date.now();
+  const entries = await readdir(uploadRoot, { withFileTypes: true }).catch(() => []);
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        try {
+          const manifest = JSON.parse(await readFile(join(uploadRoot, entry.name, "manifest.json"), "utf8"));
+          if (Date.parse(manifest.expiresAt || "") > now) return;
+          await rm(join(uploadRoot, entry.name), { recursive: true, force: true });
+        } catch {
+          // Ignore stale or partially written upload directories.
+        }
+      }),
+  );
+}
+
+async function saveUpload(req) {
+  const contentLength = Number(req.headers["content-length"] || 0);
+  if (contentLength && contentLength > uploadMaxFileBytes + 1024 * 1024) {
+    throw new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`);
+  }
+
+  await mkdir(uploadRoot, { recursive: true });
+  cleanupExpiredUploadsQuiet().catch(() => {});
+
+  return new Promise((resolveUpload, rejectUpload) => {
+    const busboy = Busboy({
+      headers: req.headers,
+      limits: {
+        files: 1,
+        fileSize: uploadMaxFileBytes,
+      },
+    });
+    let fileSeen = false;
+    let filePromise = null;
+
+    busboy.on("file", (field, file, info) => {
+      if (field !== "file" || fileSeen) {
+        file.resume();
+        return;
+      }
+      fileSeen = true;
+      filePromise = (async () => {
+        const id = randomUUID();
+        const originalName = safeUploadName(info.filename || "upload");
+        const dir = join(uploadRoot, id);
+        const filePath = join(dir, originalName);
+        const createdAt = new Date();
+        let size = 0;
+        let tooLarge = false;
+        try {
+          await mkdir(dir, { recursive: true });
+          const output = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
+          file.on("data", (chunk) => {
+            size += chunk.length;
+          });
+          file.on("limit", () => {
+            tooLarge = true;
+            output.destroy(
+              new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
+            );
+          });
+          file.pipe(output);
+          await finished(output);
+          if (tooLarge || file.truncated) {
+            throw new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`);
+          }
+          const manifest = {
+            id,
+            name: originalName,
+            originalName,
+            mime: info.mimeType || "application/octet-stream",
+            size,
+            path: filePath,
+            createdAt: createdAt.toISOString(),
+            expiresAt: new Date(createdAt.getTime() + uploadTtlMs).toISOString(),
+          };
+          await writeFile(uploadMetaPath(id), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+          await writeAuditEventQuiet(auditLogPath, "attachment_upload", {
+            attachmentId: id,
+            name: originalName,
+            mime: manifest.mime,
+            size,
+          });
+          return manifest;
+        } catch (error) {
+          await rm(dir, { recursive: true, force: true }).catch(() => {});
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(500, "UPLOAD_FAILED", error instanceof Error ? error.message : "Upload failed.");
+        }
+      })();
+    });
+
+    busboy.on("filesLimit", () => rejectUpload(new HttpError(400, "TOO_MANY_FILES", "Upload one file at a time.")));
+    busboy.on("error", (error) => rejectUpload(new HttpError(400, "UPLOAD_PARSE_ERROR", error.message)));
+    busboy.on("finish", async () => {
+      try {
+        if (!fileSeen || !filePromise) throw new HttpError(400, "FILE_REQUIRED", "Upload field `file` is required.");
+        resolveUpload(await filePromise);
+      } catch (error) {
+        rejectUpload(error);
+      }
+    });
+    req.pipe(busboy);
+  });
 }
 
 function requireAuth(req, res) {
@@ -369,9 +520,15 @@ async function getChangeStats(rootReal, entries) {
 function parseCommitLog(log) {
   return log
     ? log.split("\n").filter(Boolean).map((line) => {
-        const [hash = "", date = "", author = "", refs = "", ...subjectParts] = line.split("\t");
+        const parts = line.split("\t");
+        const hasParentFields = parts.length >= 7;
+        const [hash = "", fullHash = "", parentsRaw = "", date = "", author = "", refs = "", ...subjectParts] = hasParentFields
+          ? parts
+          : [parts[0] || "", parts[0] || "", "", parts[1] || "", parts[2] || "", parts[3] || "", ...parts.slice(4)];
         return {
           hash,
+          fullHash,
+          parents: parentsRaw.split(" ").filter(Boolean),
           date,
           author,
           refs: refs.trim(),
@@ -514,9 +671,11 @@ async function getGitInfo(url) {
     runCommand("git", ["-C", rootReal, "status", "--short", "--branch"], { timeoutMs: 5000 }).catch((error) =>
       error.message,
     ),
-    runCommand("git", ["-C", rootReal, "log", "--date=short", "--pretty=format:%h%x09%ad%x09%an%x09%d%x09%s", "--max-count=30"], {
-      timeoutMs: 5000,
-    }).catch(() => ""),
+    runCommand(
+      "git",
+      ["-C", rootReal, "log", "--date=short", "--pretty=format:%h%x09%H%x09%P%x09%ad%x09%an%x09%d%x09%s", "--max-count=30"],
+      { timeoutMs: 5000 },
+    ).catch(() => ""),
     runCommand("git", ["-C", rootReal, "remote", "-v"], { timeoutMs: 5000 }).catch(() => ""),
     runCommand("git", ["-C", rootReal, "branch", "--format=%(refname:short)"], { timeoutMs: 5000 }).catch(() => ""),
     runCommand("git", ["-C", rootReal, "branch", "-r", "--format=%(refname:short)"], { timeoutMs: 5000 }).catch(() => ""),
@@ -817,6 +976,180 @@ async function readLocalSessionsIndex() {
   return new Map(Object.entries(parsed));
 }
 
+async function writeLocalSessionsIndex(index) {
+  await mkdir(openclawSessionsDir, { recursive: true });
+  const tmp = `${openclawSessionsIndex}.${process.pid}.${Date.now()}.tmp`;
+  const payload = JSON.stringify(Object.fromEntries(index), null, 2);
+  await writeFile(tmp, `${payload}\n`, { mode: 0o600 });
+  await rename(tmp, openclawSessionsIndex);
+}
+
+function normalizeAppSessionState(raw) {
+  const state = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const projectBindings =
+    state.projectBindings && typeof state.projectBindings === "object" && !Array.isArray(state.projectBindings)
+      ? state.projectBindings
+      : {};
+  return {
+    version: 1,
+    projectBindings: Object.fromEntries(
+      Object.entries(projectBindings)
+        .filter(([sessionKey, projectPath]) => typeof sessionKey === "string" && typeof projectPath === "string")
+        .map(([sessionKey, projectPath]) => [sessionKey, projectPath]),
+    ),
+  };
+}
+
+async function readAppSessionState() {
+  try {
+    return normalizeAppSessionState(JSON.parse(await readFile(appSessionStatePath, "utf8")));
+  } catch {
+    return normalizeAppSessionState(null);
+  }
+}
+
+async function writeAppSessionState(state) {
+  await mkdir(dataDir, { recursive: true });
+  const tmp = `${appSessionStatePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(normalizeAppSessionState(state), null, 2)}\n`, { mode: 0o600 });
+  await rename(tmp, appSessionStatePath);
+}
+
+function withSessionProjectBindings(sessions, appState) {
+  return sessions.map((session) => ({
+    ...session,
+    projectPath: appState.projectBindings[session.key] || "",
+  }));
+}
+
+async function normalizeProjectBindingPath(projectPath) {
+  const value = String(projectPath || "").trim();
+  if (!value) return "";
+  const repo = await getRepoRootFromPath(value);
+  if (!repo.ok) throw new HttpError(repo.status || 400, repo.code || "INVALID_PROJECT_PATH", repo.message || "Invalid project path.");
+  if (!repo.isRepo) throw new HttpError(400, "NOT_REPOSITORY", "Project path is not a Git repository.");
+  return repo.rootDisplayPath;
+}
+
+function mobileStudioSessionName(index) {
+  return `Mobile Studio ${index}`;
+}
+
+function mobileStudioSessionKey(id) {
+  return `agent:main:mobile-studio:session:${id}`;
+}
+
+async function createMobileStudioSession(req) {
+  const body = await readJson(req);
+  const name = String(body.name || "").trim().slice(0, 80);
+  const index = await readLocalSessionsIndex();
+  const id = randomUUID();
+  const sessionId = randomUUID();
+  const now = Date.now();
+  const sessionKey = mobileStudioSessionKey(id);
+  const sessionFile = join(openclawSessionsDir, `${sessionId}.jsonl`);
+  const trajectoryFile = join(openclawSessionsDir, `${sessionId}.trajectory.jsonl`);
+  const displayName =
+    name ||
+    mobileStudioSessionName(
+      [...index.keys()].filter((key) => key.startsWith("agent:main:mobile-studio:session:")).length + 1,
+    );
+  const entry = {
+    sessionId,
+    agentId: "main",
+    kind: "mobile-studio",
+    chatType: "mobile-studio",
+    displayName,
+    subject: displayName,
+    status: "done",
+    origin: {
+      label: displayName,
+      provider: "mobile-studio",
+      surface: "mobile-studio",
+      chatType: "session",
+      from: "mobile-studio",
+      to: "agent:main",
+      accountId: "local",
+    },
+    sessionFile,
+    trajectoryFile,
+    createdAt: now,
+    updatedAt: now,
+    lastInteractionAt: now,
+  };
+  index.set(sessionKey, entry);
+  await mkdir(openclawSessionsDir, { recursive: true });
+  await writeFile(sessionFile, "", { flag: "wx", mode: 0o600 });
+  await writeFile(trajectoryFile, "", { flag: "wx", mode: 0o600 });
+  await writeLocalSessionsIndex(index);
+  await writeAuditEventQuiet(auditLogPath, "session_create", { sessionKey });
+  return { ok: true, session: { ...normalizeLocalSession(sessionKey, entry), hasLocalHistory: false, projectPath: "" } };
+}
+
+async function setSessionProject(req) {
+  const body = await readJson(req);
+  const sessionKey = String(body.sessionKey || "").trim();
+  const projectPath = await normalizeProjectBindingPath(body.projectPath || "");
+  if (!sessionKey) return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
+  const index = await readLocalSessionsIndex();
+  if (!index.has(sessionKey)) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  const appState = await readAppSessionState();
+  if (!projectPath) delete appState.projectBindings[sessionKey];
+  else appState.projectBindings[sessionKey] = projectPath;
+  await writeAppSessionState(appState);
+  await writeAuditEventQuiet(auditLogPath, projectPath ? "session_project_attach" : "session_project_detach", {
+    sessionKey,
+    projectPath,
+  });
+  return { ok: true, sessionKey, projectPath };
+}
+
+async function moveIfExists(source, targetDir) {
+  if (!source) return;
+  const sourcePath = resolve(source);
+  const sessionsRoot = resolve(openclawSessionsDir);
+  if (sourcePath !== sessionsRoot && !sourcePath.startsWith(`${sessionsRoot}${sep}`)) return;
+  try {
+    await stat(sourcePath);
+  } catch {
+    return;
+  }
+  await mkdir(targetDir, { recursive: true });
+  const targetPath = join(targetDir, basename(sourcePath));
+  await rename(sourcePath, targetPath);
+}
+
+async function deleteSession(req) {
+  const body = await readJson(req);
+  const sessionKey = String(body.sessionKey || "").trim();
+  if (!sessionKey) return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
+  const index = await readLocalSessionsIndex();
+  const entry = index.get(sessionKey);
+  if (!entry) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Session not found." };
+  const normalized = normalizeLocalSession(sessionKey, entry);
+  if (normalized.hasActiveRun) {
+    return { ok: false, status: 409, code: "SESSION_ACTIVE", message: "Stop the active run before deleting this session." };
+  }
+
+  const tombstone = join(deletedSessionsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${entry.sessionId || randomUUID()}`);
+  await mkdir(tombstone, { recursive: true });
+  await writeFile(join(tombstone, "session-entry.json"), `${JSON.stringify({ sessionKey, entry }, null, 2)}\n`, { mode: 0o600 });
+  await Promise.all([
+    moveIfExists(entry.sessionFile, tombstone),
+    moveIfExists(entry.trajectoryFile, tombstone),
+    entry.sessionFile ? moveIfExists(`${entry.sessionFile}.codex-app-server.json`, tombstone) : Promise.resolve(),
+    entry.sessionId ? moveIfExists(join(openclawSessionsDir, `${entry.sessionId}.trajectory-path.json`), tombstone) : Promise.resolve(),
+  ]);
+
+  index.delete(sessionKey);
+  await writeLocalSessionsIndex(index);
+  const appState = await readAppSessionState();
+  delete appState.projectBindings[sessionKey];
+  await writeAppSessionState(appState);
+  await writeAuditEventQuiet(auditLogPath, "session_delete", { sessionKey, tombstone });
+  return { ok: true, sessionKey };
+}
+
 function normalizeLocalSession(key, session) {
   const origin = session.origin || {};
   const status = session.status || "";
@@ -850,6 +1183,7 @@ function normalizeLocalSession(key, session) {
 
 async function listSessionsLocal() {
   const index = await readLocalSessionsIndex();
+  const appState = await readAppSessionState();
   const sessions = await Promise.all(
     [...index.entries()].map(async ([key, session]) => ({
       ...normalizeLocalSession(key, session),
@@ -863,7 +1197,7 @@ async function listSessionsLocal() {
   const limitedSessions = sessions.slice(0, 50);
   return {
     ok: true,
-    sessions: limitedSessions,
+    sessions: withSessionProjectBindings(limitedSessions, appState),
     defaults: null,
     count: limitedSessions.length,
     source: "local",
@@ -1095,8 +1429,9 @@ async function listSessions() {
   try {
     return await listSessionsLocal();
   } catch {
+    const appState = await readAppSessionState();
     const result = await gatewayCall("sessions.list", { limit: 50 }, { timeoutMs: 10000 });
-    const sessions = Array.isArray(result.sessions) ? result.sessions.map(normalizeSession) : [];
+    const sessions = Array.isArray(result.sessions) ? withSessionProjectBindings(result.sessions.map(normalizeSession), appState) : [];
     return {
       ok: true,
       sessions,
@@ -1397,12 +1732,51 @@ async function getAttention(url = new URL("http://local/api/attention")) {
   };
 }
 
+async function resolveChatAttachments(rawAttachments) {
+  const items = Array.isArray(rawAttachments) ? rawAttachments : [];
+  if (items.length > uploadMaxAttachmentsPerMessage) {
+    throw new HttpError(
+      400,
+      "TOO_MANY_ATTACHMENTS",
+      `Attach at most ${uploadMaxAttachmentsPerMessage} file(s) per message.`,
+    );
+  }
+  return Promise.all(
+    items.map(async (item) => {
+      const id = typeof item === "string" ? item : item?.id;
+      return readUploadManifest(id);
+    }),
+  );
+}
+
+function attachmentPromptBlock(attachments) {
+  if (!attachments.length) return "";
+  const lines = [
+    "",
+    "",
+    "Allegati gia caricati sul server e leggibili dal filesystem:",
+    ...attachments.map((attachment, index) =>
+      [
+        `${index + 1}. ${attachment.name}`,
+        `   path: ${attachment.path}`,
+        `   mime: ${attachment.mime}`,
+        `   size: ${attachment.size} bytes`,
+        `   expiresAt: ${attachment.expiresAt}`,
+      ].join("\n"),
+    ),
+    "",
+    "Usa questi path per leggere i file. Se un file deve restare, copialo esplicitamente nel progetto o nell'archivio prima del cleanup.",
+  ];
+  return lines.join("\n");
+}
+
 async function sendMessage(req) {
   const body = await readJson(req);
   const sessionKey = typeof body.sessionKey === "string" ? body.sessionKey.trim() : "";
   const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
   const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
+  const attachments = await resolveChatAttachments(body.attachments);
   const audit = body.audit && typeof body.audit === "object" && !Array.isArray(body.audit) ? body.audit : null;
   const idempotencyKey =
     typeof body.idempotencyKey === "string" && body.idempotencyKey.trim()
@@ -1411,16 +1785,17 @@ async function sendMessage(req) {
   if (!sessionKey) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
   }
-  if (!message) {
-    return { ok: false, status: 400, code: "MESSAGE_REQUIRED", message: "message is required." };
+  if (!message && attachments.length === 0) {
+    return { ok: false, status: 400, code: "MESSAGE_REQUIRED", message: "message or attachment is required." };
   }
+  const outboundMessage = `${message || "Analizza gli allegati caricati."}${attachmentPromptBlock(attachments)}`;
   const result = await gatewayCall(
     "chat.send",
     {
       sessionKey,
       ...(sessionId ? { sessionId } : {}),
       ...(agentId ? { agentId } : {}),
-      message,
+      message: outboundMessage,
       deliver: false,
       idempotencyKey,
     },
@@ -1431,7 +1806,9 @@ async function sendMessage(req) {
     sessionKey,
     agentId,
     command,
-    messageLength: message.length,
+    messageLength: outboundMessage.length,
+    attachmentCount: attachments.length,
+    attachmentBytes: attachments.reduce((total, attachment) => total + (Number(attachment.size) || 0), 0),
     ...(audit?.meta && typeof audit.meta === "object" ? audit.meta : {}),
   });
   return {
@@ -1502,6 +1879,24 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, await listSessions());
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/sessions") {
+      const result = await createMobileStudioSession(req);
+      if (!result.ok) sendError(res, result.status, result.code, result.message);
+      else sendJson(res, 200, result);
+      return;
+    }
+    if (req.method === "DELETE" && url.pathname === "/api/sessions") {
+      const result = await deleteSession(req);
+      if (!result.ok) sendError(res, result.status, result.code, result.message);
+      else sendJson(res, 200, result);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/session-project") {
+      const result = await setSessionProject(req);
+      if (!result.ok) sendError(res, result.status, result.code, result.message);
+      else sendJson(res, 200, result);
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/api/history") {
       const result = await getHistory(url);
       if (!result.ok) sendError(res, result.status, result.code, result.message);
@@ -1565,6 +1960,11 @@ async function handleApi(req, res, url) {
       else sendJson(res, 200, result);
       return;
     }
+    if (req.method === "POST" && url.pathname === "/api/uploads") {
+      const attachment = await saveUpload(req);
+      sendJson(res, 200, { ok: true, attachment });
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/api/send") {
       const result = await sendMessage(req);
       if (!result.ok) sendError(res, result.status, result.code, result.message);
@@ -1579,6 +1979,10 @@ async function handleApi(req, res, url) {
     }
     sendError(res, 404, "NOT_FOUND", "Unknown API endpoint.");
   } catch (error) {
+    if (error instanceof HttpError) {
+      sendError(res, error.status, error.code, error.message);
+      return;
+    }
     sendError(res, 500, "API_ERROR", error instanceof Error ? error.message : String(error));
   }
 }

@@ -6,6 +6,9 @@
     <meta name="theme-color" content="#111820" />
     <title>OpenClaw Mobile Studio</title>
     <link rel="manifest" href="manifest.webmanifest" />
+    <script>
+      document.documentElement.dataset.theme = localStorage.getItem("oms.theme") === "light" ? "light" : "dark";
+    </script>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -32,6 +35,7 @@
             <button class="nav-item active" type="button" data-view="home">Home</button>
             <button class="nav-item" type="button" data-view="chat">Chat</button>
             <button class="nav-item" type="button" data-view="files">Files</button>
+            <button class="nav-item" type="button" data-view="settings">Settings</button>
             <a class="nav-item" href="/" target="_blank" rel="noreferrer">Open File Browser</a>
           </nav>
         </div>
@@ -72,6 +76,29 @@
         </section>
       </section>
 
+      <section id="settingsView" class="view settings-view" hidden>
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <h2>Theme</h2>
+          </div>
+          <div class="theme-control" role="group" aria-label="Theme">
+            <button class="theme-option active" type="button" data-theme-choice="dark" aria-pressed="true">
+              <strong>Dark</strong>
+            </button>
+            <button class="theme-option" type="button" data-theme-choice="light" aria-pressed="false">
+              <strong>Light</strong>
+            </button>
+          </div>
+        </section>
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <h2>Sessions</h2>
+            <button id="createSessionButton" class="icon-button" type="button">New session</button>
+          </div>
+          <div id="settingsSessionList" class="settings-session-list" aria-live="polite"></div>
+        </section>
+      </section>
+
       <section id="chatView" class="view">
         <section class="session-panel">
           <label for="sessionSelect">Session</label>
@@ -89,6 +116,7 @@
             <div id="commandHint" class="command-hint">/new · /reset · /compact · /stop</div>
           </div>
           <div id="commandPalette" class="command-palette" hidden></div>
+          <div id="attachmentList" class="attachment-list" hidden></div>
           <textarea
             id="messageInput"
             name="message"
@@ -96,6 +124,8 @@
             placeholder="Message OpenClaw"
             autocomplete="off"
           ></textarea>
+          <input id="fileInput" class="sr-only" type="file" multiple />
+          <button id="attachButton" class="attach-button" type="button" aria-label="Attach files">Attach</button>
           <button id="sendButton" type="submit">Send</button>
         </form>
       </section>
