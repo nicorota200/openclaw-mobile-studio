@@ -12,6 +12,8 @@
   "scripts": {
     "dev": "node server.js",
     "start": "NODE_ENV=production node server.js",
+    "check": "node scripts/check.mjs",
+    "test": "node --test tests/*.test.mjs",
     "visual:smoke": "node tests/visual-smoke.mjs"
   },
   "engines": {

@@ -116,29 +116,36 @@ https://your-node.your-tailnet.ts.net/mobile-studio/
 
 ## Tests
 
-Syntax checks:
+Local quality baseline (no Gateway or browser required):
 
 ```bash
-node --check server.js
-node --check lib/audit.js
-node --check public/app.js
-node --check public/project-actions.js
-node --check tests/visual-smoke.mjs
+npm ci --ignore-scripts
+npm run check
+npm test
 ```
 
-Visual smoke test:
+`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for project action prompts, audit metadata/read limits/rotation, and upload regressions. Upload tests start disposable copies of the server on OS-assigned loopback ports with temporary data and an unavailable Gateway executable. They never start the normal service or use its session store.
+
+GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Browser tests are deliberately separate.
+
+Visual smoke test against an already running local service:
 
 ```bash
 npm run visual:smoke
 ```
 
-With a custom Chromium:
+With an explicit URL and Chromium:
 
 ```bash
+MOBILE_STUDIO_URL=http://127.0.0.1:8787/mobile-studio/ \
 CHROMIUM_PATH=/path/to/chromium npm run visual:smoke
 ```
 
-Screenshots are written under `test-artifacts/`.
+Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. The suite includes mocked send/upload/session-management interactions and a delayed Settings response regression, but it also reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements make the full suite unsuitable for generic CI without fixtures. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
+
+Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; the isolated upload tests cover the stabilization's server fixes.
+
+See [v0.1 stabilization notes](docs/STABILIZATION-v0.1.md) for the local proof and remaining review concerns.
 
 ## Security Notes
 

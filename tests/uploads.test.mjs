@@ -1,0 +1,155 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { request } from "node:http";
+import { cp, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { setTimeout } from "node:timers/promises";
+
+async function startUploadServer(t) {
+  // Copy only application code into a disposable root: never use real runtime data.
+  const dir = await mkdtemp(join(tmpdir(), "oms-upload-test-"));
+  let child;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+  const root = new URL("../", import.meta.url);
+  await cp(new URL("server.js", root), join(dir, "server.mjs"));
+  await cp(new URL("lib/", root), join(dir, "lib"), { recursive: true });
+  await writeFile(join(dir, "package.json"), '{"type":"module"}');
+  await symlink(fileURLToPath(new URL("node_modules/", root)), join(dir, "node_modules"), "dir");
+  // The wrapper reports the OS-assigned port without changing production startup.
+  await writeFile(join(dir, "start.mjs"), `
+    import { Server } from 'node:http';
+    const listen = Server.prototype.listen;
+    Server.prototype.listen = function (...args) {
+      this.once('listening', () => process.send({ port: this.address().port }));
+      return listen.apply(this, args);
+    };
+    await import('./server.mjs');
+  `);
+  child = spawn(process.execPath, [join(dir, "start.mjs")], {
+    cwd: dir,
+    env: {
+      PATH: process.env.PATH,
+      HOST: "127.0.0.1", PORT: "0",
+      MOBILE_STUDIO_TOKEN: "",
+      MOBILE_STUDIO_FILE_ROOT: dir,
+      MOBILE_STUDIO_UPLOAD_DIR: join(dir, "uploads"),
+      MOBILE_STUDIO_MAX_UPLOAD_BYTES: "64",
+      OPENCLAW_BIN: join(dir, "no-gateway"),
+      OPENCLAW_SESSIONS_DIR: join(dir, "sessions"),
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  let errors = "";
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { errors += chunk; });
+  const [address] = await once(child, "message", { signal: AbortSignal.timeout(5000) });
+  return {
+    dir,
+    url: `http://127.0.0.1:${address.port}/api/uploads`,
+    assertAlive() { assert.equal(child.exitCode, null, `upload crashed the server: ${errors}`); },
+  };
+}
+
+async function upload(server, name, content) {
+  const form = new FormData();
+  form.append("file", new Blob([content], { type: "text/plain" }), name);
+  return fetch(server.url, { method: "POST", body: form, signal: AbortSignal.timeout(5000) });
+}
+
+test("uploads named manifest.json retain their original bytes separately from metadata", async (t) => {
+  const server = await startUploadServer(t);
+  const response = await upload(server, "manifest.json", "user file contents");
+  assert.equal(response.status, 200);
+  const { attachment } = await response.json();
+  assert.equal(attachment.name, "manifest.json");
+  assert.equal(attachment.size, 18);
+  assert.equal(await readFile(attachment.path, "utf8"), "user file contents");
+  const manifest = JSON.parse(await readFile(join(server.dir, "uploads", attachment.id, "manifest.json"), "utf8"));
+  assert.equal(manifest.path, attachment.path);
+  server.assertAlive();
+});
+
+test("oversized uploads return 413, clean partial files, and keep the server available", async (t) => {
+  const server = await startUploadServer(t);
+  const response = await upload(server, "large.txt", "x".repeat(128));
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).error.code, "UPLOAD_TOO_LARGE");
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  assert.equal((await upload(server, "small.txt", "ok")).status, 200);
+  server.assertAlive();
+});
+
+test("truncated multipart uploads return 400 and leave the server available", async (t) => {
+  const server = await startUploadServer(t);
+  const response = await fetch(server.url, {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=fixture" },
+    body: '--fixture\r\nContent-Disposition: form-data; name="file"; filename="sample.txt"\r\nContent-Type: text/plain\r\n\r\nunfinished',
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "UPLOAD_PARSE_ERROR");
+  // A second malformed request also proves the process survives parser errors.
+  const next = await fetch(server.url, { method: "POST", signal: AbortSignal.timeout(5000) });
+  assert.equal(next.status, 400);
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  assert.equal((await upload(server, "small.txt", "ok")).status, 200);
+  server.assertAlive();
+});
+
+test("multiple files are rejected and cleaned without recording a successful upload", async (t) => {
+  const server = await startUploadServer(t);
+  const form = new FormData();
+  form.append("file", new Blob(["first"]), "first.txt");
+  form.append("file", new Blob(["second"]), "second.txt");
+  const response = await fetch(server.url, { method: "POST", body: form, signal: AbortSignal.timeout(5000) });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "TOO_MANY_FILES");
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  await assert.rejects(readFile(join(server.dir, "data", "audit-log.jsonl")), { code: "ENOENT" });
+  server.assertAlive();
+});
+
+test("missing file fields return 400 without creating attachment data", async (t) => {
+  const server = await startUploadServer(t);
+  const form = new FormData();
+  form.append("description", "no file");
+  const response = await fetch(server.url, { method: "POST", body: form, signal: AbortSignal.timeout(5000) });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "FILE_REQUIRED");
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+});
+
+async function waitUntil(predicate) {
+  const deadline = Date.now() + 3000;
+  while (!(await predicate())) {
+    assert.ok(Date.now() < deadline, "timed out waiting for upload cleanup state");
+    await setTimeout(10);
+  }
+}
+
+test("client disconnect cleans a partial upload and keeps the server available", async (t) => {
+  const server = await startUploadServer(t);
+  const req = request(server.url, {
+    method: "POST", headers: { "content-type": "multipart/form-data; boundary=fixture" },
+  });
+  req.on("error", () => {});
+  t.after(() => req.destroy());
+  req.write('--fixture\r\nContent-Disposition: form-data; name="file"; filename="partial.txt"\r\n\r\npartial');
+  const uploads = () => readdir(join(server.dir, "uploads")).catch(() => []);
+  await waitUntil(async () => (await uploads()).length === 1);
+  req.destroy();
+  await waitUntil(async () => (await uploads()).length === 0);
+  assert.equal((await upload(server, "small.txt", "ok")).status, 200);
+  server.assertAlive();
+});

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join, normalize, relative, resolve, sep } from "node:path";
-import { finished } from "node:stream/promises";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import Busboy from "busboy";
 import { readAuditEvents, writeAuditEventQuiet } from "./lib/audit.js";
@@ -181,28 +181,45 @@ async function saveUpload(req) {
   await mkdir(uploadRoot, { recursive: true });
   cleanupExpiredUploadsQuiet().catch(() => {});
 
-  return new Promise((resolveUpload, rejectUpload) => {
-    const busboy = Busboy({
+  let busboy;
+  try {
+    busboy = Busboy({
       headers: req.headers,
       limits: {
         files: 1,
         fileSize: uploadMaxFileBytes,
       },
     });
-    let fileSeen = false;
-    let filePromise = null;
+  } catch (error) {
+    throw new HttpError(400, "UPLOAD_PARSE_ERROR", error.message);
+  }
+  let fileSeen = false;
+  let filePromise = null;
+  let uploadDir = null;
+  let inputFile = null;
+  let uploadError = null;
+  const abortUpload = () => busboy.destroy(new HttpError(400, "UPLOAD_ABORTED", "Upload was interrupted."));
+  req.once("aborted", abortUpload);
+  req.once("error", abortUpload);
 
+  const parsed = new Promise((resolveParsed, rejectParsed) => {
     busboy.on("file", (field, file, info) => {
+      // A rejected field can also emit an error on malformed multipart input.
+      file.on("error", () => {});
       if (field !== "file" || fileSeen) {
         file.resume();
         return;
       }
       fileSeen = true;
+      inputFile = file;
+      // The error listener also covers parsing failures while mkdir is pending.
       filePromise = (async () => {
         const id = randomUUID();
         const originalName = safeUploadName(info.filename || "upload");
         const dir = join(uploadRoot, id);
-        const filePath = join(dir, originalName);
+        uploadDir = dir;
+        // Keep user bytes distinct from our manifest, including for manifest.json.
+        const filePath = join(dir, `file-${originalName}`);
         const createdAt = new Date();
         let size = 0;
         let tooLarge = false;
@@ -214,12 +231,8 @@ async function saveUpload(req) {
           });
           file.on("limit", () => {
             tooLarge = true;
-            output.destroy(
-              new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
-            );
           });
-          file.pipe(output);
-          await finished(output);
+          await pipeline(file, output);
           if (tooLarge || file.truncated) {
             throw new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`);
           }
@@ -234,12 +247,6 @@ async function saveUpload(req) {
             expiresAt: new Date(createdAt.getTime() + uploadTtlMs).toISOString(),
           };
           await writeFile(uploadMetaPath(id), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-          await writeAuditEventQuiet(auditLogPath, "attachment_upload", {
-            attachmentId: id,
-            name: originalName,
-            mime: manifest.mime,
-            size,
-          });
           return manifest;
         } catch (error) {
           await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -247,20 +254,43 @@ async function saveUpload(req) {
           throw new HttpError(500, "UPLOAD_FAILED", error instanceof Error ? error.message : "Upload failed.");
         }
       })();
+      // Observe write failures immediately, even if the parser has not finished.
+      filePromise.catch((error) => {
+        uploadError ||= error;
+        busboy.destroy(error);
+      });
     });
 
-    busboy.on("filesLimit", () => rejectUpload(new HttpError(400, "TOO_MANY_FILES", "Upload one file at a time.")));
-    busboy.on("error", (error) => rejectUpload(new HttpError(400, "UPLOAD_PARSE_ERROR", error.message)));
-    busboy.on("finish", async () => {
-      try {
-        if (!fileSeen || !filePromise) throw new HttpError(400, "FILE_REQUIRED", "Upload field `file` is required.");
-        resolveUpload(await filePromise);
-      } catch (error) {
-        rejectUpload(error);
-      }
+    busboy.on("filesLimit", () => {
+      uploadError ||= new HttpError(400, "TOO_MANY_FILES", "Upload one file at a time.");
     });
+    busboy.on("error", (error) => rejectParsed(new HttpError(400, "UPLOAD_PARSE_ERROR", error.message)));
+    busboy.on("finish", resolveParsed);
     req.pipe(busboy);
   });
+  try {
+    await parsed;
+    if (uploadError) throw uploadError;
+    if (!filePromise) throw new HttpError(400, "FILE_REQUIRED", "Upload field `file` is required.");
+    const manifest = await filePromise;
+    await writeAuditEventQuiet(auditLogPath, "attachment_upload", {
+      attachmentId: manifest.id,
+      name: manifest.name,
+      mime: manifest.mime,
+      size: manifest.size,
+    });
+    return manifest;
+  } catch (error) {
+    const failure = uploadError || error;
+    inputFile?.destroy();
+    await filePromise?.catch(() => {});
+    if (uploadDir) await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
+    throw failure;
+  } finally {
+    req.unpipe(busboy);
+    req.off("aborted", abortUpload);
+    req.off("error", abortUpload);
+  }
 }
 
 function requireAuth(req, res) {

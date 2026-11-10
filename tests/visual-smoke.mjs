@@ -394,6 +394,47 @@ async function checkFiles(page, name) {
   await page.screenshot({ path: new URL(`${name}-files.png`, artifactsDir).pathname, fullPage: true });
 }
 
+async function checkSettingsSessionRows(page, name) {
+  // DOMContentLoaded and the list container precede the async sessions response.
+  await page.locator("#settingsSessionList .settings-session-row").first().waitFor({
+    state: "visible",
+    timeout: 35_000,
+  });
+  const sessionRows = await page.locator("#settingsSessionList .settings-session-row").count();
+  assert(sessionRows > 0, `${name} expected settings session rows`);
+}
+
+async function checkDelayedSettingsSessions(browser) {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await context.newPage();
+  let releaseSessions;
+  const sessionsReady = new Promise((resolve) => { releaseSessions = resolve; });
+  const sessions = Array.from({ length: 7 }, (_, index) => ({
+    key: `agent:main:mobile-studio:session:delayed-${index}`,
+    displayName: `Delayed session ${index + 1}`,
+    status: "idle",
+    projectPath: "",
+  }));
+  await page.route("**/api/sessions", async (route) => {
+    await sessionsReady;
+    await route.fulfill({ json: { ok: true, sessions } });
+  });
+  try {
+    await page.goto(`${baseUrl}?view=settings`, { waitUntil: "domcontentloaded" });
+    assert(await page.locator(".settings-session-row").count() === 0, "delayed Settings fixture loaded too early");
+    // Start the same product assertion while the response is still held back.
+    const rowsReady = checkSettingsSessionRows(page, "delayed Settings");
+    releaseSessions();
+    await rowsReady;
+    assert(await page.locator(".settings-session-row").count() === 7, "delayed Settings did not render all 7 sessions");
+    console.log("Settings race regression passed: 0 rows before response, 7 after response");
+  } finally {
+    releaseSessions();
+    await page.unrouteAll({ behavior: "ignoreErrors" });
+    await context.close();
+  }
+}
+
 async function checkSettingsTheme(page, name) {
   await page.goto(`${baseUrl}?view=settings`, { waitUntil: "domcontentloaded" });
   await visibleBox(page, ".settings-section", `${name} settings section`);
@@ -405,8 +446,7 @@ async function checkSettingsTheme(page, name) {
   assert(title === "Settings", `${name} expected Settings title, got "${title}"`);
   const themeButtons = await page.locator(".theme-option").count();
   assert(themeButtons === 2, `${name} expected 2 theme buttons, got ${themeButtons}`);
-  const sessionRows = await page.locator(".settings-session-row").count();
-  assert(sessionRows > 0, `${name} expected settings session rows`);
+  await checkSettingsSessionRows(page, name);
 
   await page.locator('[data-theme-choice="light"]').click();
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
@@ -885,6 +925,7 @@ const browser = await chromium.launch({
 });
 
 try {
+  await checkDelayedSettingsSessions(browser);
   await checkCachedSessionFirstPaint(browser);
   await checkMessageFormatting(browser);
   await checkChatMessageOrderAndComposer(browser);
