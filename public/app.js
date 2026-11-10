@@ -1,4 +1,5 @@
 import { projectActionLabel, projectActionPrompt, projectActions } from "./project-actions.js";
+import { attachmentItemsForSend, attachmentQueue, removeAttachmentItems } from "./attachment-state.js";
 
 const initialParams = new URLSearchParams(window.location.search);
 
@@ -41,7 +42,7 @@ const state = {
   loading: false,
   filesLoading: false,
   sending: false,
-  pendingAttachments: [],
+  pendingAttachmentsBySession: {},
   pollTimer: null,
   runPollTimer: null,
   historyPollInFlight: false,
@@ -130,7 +131,6 @@ const els = {
   homeActions: Array.from(document.querySelectorAll("[data-home-action]")),
   settingsView: document.getElementById("settingsView"),
   themeOptions: Array.from(document.querySelectorAll("[data-theme-choice]")),
-  createSessionButton: document.getElementById("createSessionButton"),
   settingsSessionList: document.getElementById("settingsSessionList"),
   chatView: document.getElementById("chatView"),
   filesView: document.getElementById("filesView"),
@@ -897,6 +897,7 @@ function renderSessions() {
   els.sessionSelect.value = state.selectedSessionKey;
   state.selectedSession = state.sessions.find((session) => session.key === state.selectedSessionKey) || null;
   loadChatProjectAttachment();
+  renderAttachments();
   renderSessionMeta();
   renderSettingsSessions();
 }
@@ -965,12 +966,7 @@ function renderSettingsSessions() {
     detach.dataset.sessionAction = "detach";
     detach.textContent = "Detach";
     detach.disabled = !session.projectPath || Boolean(state.sessionActionBusy);
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.dataset.sessionAction = "delete";
-    remove.textContent = "Delete";
-    remove.disabled = isActiveRunSession(session) || Boolean(state.sessionActionBusy);
-    actions.append(open, detach, remove);
+    actions.append(open, detach);
     row.append(main, actions);
     els.settingsSessionList.append(row);
   }
@@ -2556,14 +2552,16 @@ async function sendProjectAction(action, info = state.projectInfo) {
       counts: changeCounts(info),
     }),
     {
-    audit: {
-      type: "project_action",
-      meta: {
-        action,
-        projectPath: path,
-        branch: info?.branch || "",
+      includeAttachments: false,
+      clearComposer: false,
+      audit: {
+        type: "project_action",
+        meta: {
+          action,
+          projectPath: path,
+          branch: info?.branch || "",
+        },
       },
-    },
     },
   );
 }
@@ -2721,10 +2719,19 @@ function attachmentStatusText(item) {
   return `${formatBytes(item.size)} · ${item.progress || 0}%`;
 }
 
+function attachmentsForSession(sessionKey = state.selectedSessionKey) {
+  return attachmentQueue(state, sessionKey);
+}
+
+function removeSessionAttachments(sessionKey, localIds) {
+  removeAttachmentItems(state, sessionKey, localIds);
+}
+
 function renderAttachments() {
+  const attachments = attachmentsForSession();
   els.attachmentList.innerHTML = "";
-  els.attachmentList.hidden = state.pendingAttachments.length === 0;
-  for (const item of state.pendingAttachments) {
+  els.attachmentList.hidden = attachments.length === 0;
+  for (const item of attachments) {
     const row = document.createElement("div");
     row.className = `attachment-chip attachment-${item.status}`;
     const main = document.createElement("span");
@@ -2737,7 +2744,7 @@ function renderAttachments() {
     remove.type = "button";
     remove.textContent = "Remove";
     remove.addEventListener("click", () => {
-      state.pendingAttachments = state.pendingAttachments.filter((attachment) => attachment.localId !== item.localId);
+      removeSessionAttachments(item.sessionKey, [item.localId]);
       renderAttachments();
     });
     row.append(main, remove);
@@ -2746,11 +2753,14 @@ function renderAttachments() {
 }
 
 async function addAttachmentFiles(files) {
+  const sessionKey = state.selectedSessionKey;
+  if (!sessionKey) return;
   const selected = Array.from(files || []).slice(0, 5);
   if (selected.length === 0) return;
   for (const file of selected) {
     const item = {
       localId: crypto.randomUUID(),
+      sessionKey,
       name: file.name || "upload",
       size: file.size,
       type: file.type || "application/octet-stream",
@@ -2759,7 +2769,7 @@ async function addAttachmentFiles(files) {
       attachment: null,
       error: "",
     };
-    state.pendingAttachments.push(item);
+    attachmentsForSession(sessionKey).push(item);
     renderAttachments();
     uploadAttachment(file, item)
       .then((attachment) => {
@@ -2778,12 +2788,16 @@ async function addAttachmentFiles(files) {
   }
 }
 
-function readyAttachments() {
-  return state.pendingAttachments.filter((item) => item.status === "uploaded" && item.attachment).map((item) => item.attachment);
+function readyAttachmentItems(sessionKey = state.selectedSessionKey) {
+  return attachmentItemsForSend(state, sessionKey);
 }
 
-function hasUploadingAttachments() {
-  return state.pendingAttachments.some((item) => item.status === "uploading");
+function readyAttachments(sessionKey = state.selectedSessionKey) {
+  return readyAttachmentItems(sessionKey).map((item) => item.attachment);
+}
+
+function hasUploadingAttachments(sessionKey = state.selectedSessionKey) {
+  return attachmentsForSession(sessionKey).some((item) => item.status === "uploading");
 }
 
 function attachmentSummaryText(attachments) {
@@ -2798,8 +2812,11 @@ function attachmentSummaryText(attachments) {
 
 async function sendMessage(message, options = {}) {
   const command = message.trim().split(/\s+/)[0]?.toLowerCase() || "";
-  const attachments = readyAttachments();
   const sessionKey = state.selectedSessionKey;
+  const session = sessionByKey(sessionKey);
+  const includeAttachments = options.includeAttachments !== false;
+  const attachmentItems = attachmentItemsForSend(state, sessionKey, includeAttachments);
+  const attachments = attachmentItems.map((item) => item.attachment);
   const isNewCommand = command === "/new";
   if (command === "/new") await clearChatProjectAttachment();
   state.sending = true;
@@ -2812,8 +2829,10 @@ async function sendMessage(message, options = {}) {
     pendingStatus: "sending",
   };
   state.pendingMessages.push(localMessage);
-  els.messageInput.value = "";
-  autosizeInput();
+  if (options.clearComposer !== false) {
+    els.messageInput.value = "";
+    autosizeInput();
+  }
   renderMessages();
   setStatus("Sending to OpenClaw...");
   const idempotencyKey = `mobile-studio:${crypto.randomUUID()}`;
@@ -2822,8 +2841,8 @@ async function sendMessage(message, options = {}) {
       method: "POST",
       body: JSON.stringify({
         sessionKey,
-        sessionId: state.selectedSession?.sessionId || undefined,
-        agentId: state.selectedSession?.agentId || undefined,
+        sessionId: session?.sessionId || undefined,
+        agentId: session?.agentId || undefined,
         message,
         attachments: attachments.map((attachment) => ({ id: attachment.id })),
         idempotencyKey,
@@ -2844,10 +2863,12 @@ async function sendMessage(message, options = {}) {
     } else {
       setStatus("Message accepted by Gateway", "ok");
     }
-    state.pendingAttachments = [];
+    if (includeAttachments) removeSessionAttachments(sessionKey, attachmentItems.map((item) => item.localId));
     renderAttachments();
-    await refreshRunState({ quiet: true }).catch(() => {});
-    if (state.selectedSessionKey === sessionKey) await loadHistory({ quiet: true });
+    if (state.selectedSessionKey === sessionKey) {
+      await refreshRunState({ quiet: true }).catch(() => {});
+      await loadHistory({ quiet: true });
+    }
     startChatPolling();
     startRunPolling();
   } catch (error) {
@@ -2857,31 +2878,7 @@ async function sendMessage(message, options = {}) {
   } finally {
     state.sending = false;
     els.sendButton.disabled = false;
-    els.messageInput.focus();
-  }
-}
-
-async function createSessionFromSettings() {
-  if (state.sessionActionBusy) return;
-  state.sessionActionBusy = "create";
-  renderSettingsSessions();
-  setStatus("Creating session...");
-  try {
-    const result = await api("/api/sessions", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    await loadSessions();
-    if (result.session?.key) {
-      state.selectedSessionKey = result.session.key;
-      localStorage.setItem("oms.selectedSessionKey", result.session.key);
-      state.selectedSession = sessionByKey(result.session.key);
-    }
-    renderSessions();
-    setStatus("Session created", "ok");
-  } finally {
-    state.sessionActionBusy = "";
-    renderSettingsSessions();
+    if (state.selectedSessionKey === sessionKey) els.messageInput.focus();
   }
 }
 
@@ -2905,36 +2902,6 @@ async function detachSettingsSession(sessionKey) {
     await setSessionProjectPath(sessionKey, "");
     await loadSessions();
     setStatus("Project detached from session", "ok");
-  } finally {
-    state.sessionActionBusy = "";
-    renderSettingsSessions();
-  }
-}
-
-async function deleteSettingsSession(sessionKey) {
-  const session = sessionByKey(sessionKey);
-  if (!session || state.sessionActionBusy) return;
-  const ok = window.confirm(
-    `Delete "${displayNameForSession(session)}"?\n\nThis removes the session from Mobile Studio and its history will no longer be available here.`,
-  );
-  if (!ok) return;
-  state.sessionActionBusy = `delete:${sessionKey}`;
-  renderSettingsSessions();
-  try {
-    await api("/api/sessions", {
-      method: "DELETE",
-      body: JSON.stringify({ sessionKey }),
-    });
-    if (state.selectedSessionKey === sessionKey) {
-      state.selectedSessionKey = "";
-      state.selectedSession = null;
-      localStorage.removeItem("oms.selectedSessionKey");
-      state.messages = [];
-      state.pendingMessages = [];
-      state.messageRenderSignature = "";
-    }
-    await loadSessions();
-    setStatus("Session deleted", "ok");
   } finally {
     state.sessionActionBusy = "";
     renderSettingsSessions();
@@ -3112,6 +3079,7 @@ els.sessionSelect.addEventListener("change", async () => {
   state.messages = loadCachedMessages(state.selectedSessionKey);
   state.messageRenderSignature = "";
   renderMessages({ force: true });
+  renderAttachments();
   renderRunPanel();
   stopChatPolling();
   stopRunPolling();
@@ -3199,14 +3167,6 @@ for (const option of els.themeOptions) {
   option.addEventListener("click", () => applyTheme(option.dataset.themeChoice));
 }
 
-els.createSessionButton.addEventListener("click", () => {
-  createSessionFromSettings().catch((error) => {
-    state.sessionActionBusy = "";
-    renderSettingsSessions();
-    setStatus(error.message, "error");
-  });
-});
-
 els.settingsSessionList.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-session-action]");
   if (!button) return;
@@ -3216,8 +3176,6 @@ els.settingsSessionList.addEventListener("click", (event) => {
     openSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
   } else if (action === "detach") {
     detachSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
-  } else if (action === "delete") {
-    deleteSettingsSession(sessionKey).catch((error) => setStatus(error.message, "error"));
   }
 });
 
@@ -3278,7 +3236,7 @@ els.composer.addEventListener("submit", async (event) => {
   event.preventDefault();
   const message = els.messageInput.value.trim();
   const attachments = readyAttachments();
-  const hasFailedAttachments = state.pendingAttachments.some((item) => item.status === "failed");
+  const hasFailedAttachments = attachmentsForSession().some((item) => item.status === "failed");
   if (state.sending || !state.selectedSessionKey) return;
   if (hasUploadingAttachments()) {
     setStatus("Wait for attachments to finish uploading.", "error");

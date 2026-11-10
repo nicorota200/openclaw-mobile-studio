@@ -306,6 +306,7 @@ async function checkChatMessageOrderAndComposer(browser) {
 
 async function checkAttachmentComposer(browser) {
   const sessionKey = "agent:main:telegram:group:attachments";
+  const otherSessionKey = "agent:main:telegram:group:attachments-other";
   const sessionsPayload = {
     ok: true,
     sessions: [
@@ -316,6 +317,16 @@ async function checkAttachmentComposer(browser) {
         kind: "group",
         displayName: "Attachments",
         subject: "Attachments",
+        status: "idle",
+        hasLocalHistory: true,
+      },
+      {
+        key: otherSessionKey,
+        sessionId: "attachments-other-session",
+        agentId: "main",
+        kind: "group",
+        displayName: "Attachments Other",
+        subject: "Attachments Other",
         status: "idle",
         hasLocalHistory: true,
       },
@@ -333,15 +344,17 @@ async function checkAttachmentComposer(browser) {
   await page.route("**/api/run-state?**", (route) =>
     route.fulfill({ json: { ok: true, session: { key: sessionKey, status: "idle" }, tasks: [] } }),
   );
+  let uploadCount = 0;
   await page.route("**/api/uploads", async (route) => {
     await route.request().postDataBuffer();
+    uploadCount += 1;
     await route.fulfill({
       json: {
         ok: true,
         attachment: {
-          id: "11111111-1111-4111-8111-111111111111",
-          name: "sample.jpg",
-          originalName: "sample.jpg",
+          id: uploadCount === 1 ? "11111111-1111-4111-8111-111111111111" : "22222222-2222-4222-8222-222222222222",
+          name: uploadCount === 1 ? "sample.jpg" : "other.jpg",
+          originalName: uploadCount === 1 ? "sample.jpg" : "other.jpg",
           mime: "image/jpeg",
           size: 12,
           path: "/tmp/mobile-studio-test/sample.jpg",
@@ -364,6 +377,16 @@ async function checkAttachmentComposer(browser) {
     buffer: Buffer.from("fake-jpeg"),
   });
   await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("ready"));
+  await page.locator("#sessionSelect").selectOption(otherSessionKey);
+  await page.waitForFunction(() => document.querySelectorAll(".attachment-chip").length === 0);
+  await page.locator("#fileInput").setInputFiles({
+    name: "other.jpg",
+    mimeType: "image/jpeg",
+    buffer: Buffer.from("other-jpeg"),
+  });
+  await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("other.jpg"));
+  await page.locator("#sessionSelect").selectOption(sessionKey);
+  await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("sample.jpg"));
   await page.locator("#messageInput").fill("Guarda questa foto");
   await page.locator("#sendButton").click();
   for (let attempt = 0; attempt < 20 && !sendPayload; attempt += 1) {
@@ -372,6 +395,8 @@ async function checkAttachmentComposer(browser) {
   assert(sendPayload, "attachment send did not call /api/send");
   assert(sendPayload.message === "Guarda questa foto", "attachment send changed the user message");
   assert(sendPayload.attachments?.[0]?.id === "11111111-1111-4111-8111-111111111111", "attachment id missing from send payload");
+  await page.locator("#sessionSelect").selectOption(otherSessionKey);
+  await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("other.jpg"));
   await checkNoHorizontalOverflow(page, "attachment composer");
   await page.screenshot({ path: new URL("mobile-attachment-composer.png", artifactsDir).pathname, fullPage: true });
   await page.unrouteAll({ behavior: "ignoreErrors" });
@@ -750,6 +775,23 @@ async function checkProjectActionDoubleTap(browser) {
     const payload = route.request().postDataJSON();
     await route.fulfill({ json: { ok: true, sessionKey: payload.sessionKey, projectPath: payload.projectPath || "" } });
   });
+  await page.route("**/api/uploads", async (route) => {
+    await route.request().postDataBuffer();
+    await route.fulfill({
+      json: {
+        ok: true,
+        attachment: {
+          id: "33333333-3333-4333-8333-333333333333",
+          name: "composer-only.txt",
+          mime: "text/plain",
+          size: 8,
+          path: "/tmp/mobile-studio-test/composer-only.txt",
+          createdAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      },
+    });
+  });
   const sendPayloads = [];
   await page.route("**/api/send", async (route) => {
     sendPayloads.push(route.request().postDataJSON());
@@ -759,6 +801,17 @@ async function checkProjectActionDoubleTap(browser) {
     waitUntil: "domcontentloaded",
   });
   await visibleBox(page, ".project-action-launcher", "project action double-tap launcher");
+  await page.locator("#menuButton").click();
+  await page.locator('.nav-item[data-view="chat"]').click();
+  await page.locator("#fileInput").setInputFiles({
+    name: "composer-only.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("composer"),
+  });
+  await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("composer-only.txt"));
+  await page.locator("#menuButton").click();
+  await page.locator('.nav-item[data-view="files"]').click();
+  await visibleBox(page, ".project-action-launcher", "project action double-tap launcher after composer upload");
   await page.locator('.project-action-button[data-project-action="review_changes"]').click();
   await page.waitForFunction(() => document.querySelector("#statusText")?.textContent?.includes("Tap Review again"));
   assert(sendPayloads.length === 0, "project action sent before second tap");
@@ -771,6 +824,8 @@ async function checkProjectActionDoubleTap(browser) {
   assert(sendPayloads[0].audit?.type === "project_action", "project action send missing audit type");
   assert(sendPayloads[0].audit?.meta?.action === "review_changes", "project action audit has wrong action");
   assert(sendPayloads[0].message?.includes("Review the current changes"), "project action prompt is not the Review prompt");
+  assert(sendPayloads[0].attachments?.length === 0, "project action implicitly carried composer attachments");
+  await page.waitForFunction(() => document.querySelector(".attachment-chip")?.textContent?.includes("composer-only.txt"));
   await page.unrouteAll({ behavior: "ignoreErrors" });
   await context.close();
 }
@@ -845,7 +900,7 @@ async function checkProjectChatUsesFreeSession(browser) {
 
 async function checkSettingsSessionManagement(browser) {
   const firstKey = "agent:main:mobile-studio:session:settings-one";
-  const createdKey = "agent:main:mobile-studio:session:settings-created";
+  const secondKey = "agent:main:mobile-studio:session:settings-two";
   const sessionsPayload = {
     ok: true,
     sessions: [
@@ -860,34 +915,25 @@ async function checkSettingsSessionManagement(browser) {
         hasLocalHistory: true,
         projectPath: "projects/Existing",
       },
+      {
+        key: secondKey,
+        sessionId: null,
+        agentId: "main",
+        kind: "mobile-studio",
+        displayName: "Settings Two",
+        subject: "Settings Two",
+        status: "",
+        hasLocalHistory: false,
+        projectPath: "",
+      },
     ],
   };
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await context.newPage();
   page.setDefaultTimeout(35_000);
+  let sessionMutationRequests = 0;
   await page.route("**/api/sessions", async (route) => {
-    if (route.request().method() === "POST") {
-      const created = {
-        key: createdKey,
-        sessionId: "settings-created",
-        agentId: "main",
-        kind: "mobile-studio",
-        displayName: "Mobile Studio 2",
-        subject: "Mobile Studio 2",
-        status: "idle",
-        hasLocalHistory: false,
-        projectPath: "",
-      };
-      sessionsPayload.sessions.push(created);
-      await route.fulfill({ json: { ok: true, session: created } });
-      return;
-    }
-    if (route.request().method() === "DELETE") {
-      const payload = route.request().postDataJSON();
-      sessionsPayload.sessions = sessionsPayload.sessions.filter((session) => session.key !== payload.sessionKey);
-      await route.fulfill({ json: { ok: true, sessionKey: payload.sessionKey } });
-      return;
-    }
+    if (route.request().method() !== "GET") sessionMutationRequests += 1;
     await route.fulfill({ json: sessionsPayload });
   });
   await page.route("**/api/session-project", async (route) => {
@@ -898,20 +944,21 @@ async function checkSettingsSessionManagement(browser) {
   });
   await page.route("**/api/history?**", (route) => route.fulfill({ json: { ok: true, messages: [], source: "test" } }));
   await page.route("**/api/run-state?**", (route) =>
-    route.fulfill({ json: { ok: true, session: { key: createdKey, status: "idle" }, tasks: [] } }),
+    route.fulfill({ json: { ok: true, session: { key: secondKey, status: "idle" }, tasks: [] } }),
   );
-  page.on("dialog", (dialog) => dialog.accept());
 
   await page.goto(`${baseUrl}?view=settings`, { waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => document.querySelectorAll(".settings-session-row").length === 1);
-  await page.locator("#createSessionButton").click();
   await page.waitForFunction(() => document.querySelectorAll(".settings-session-row").length === 2);
+  assert((await page.locator(".settings-copy").textContent())?.includes("fixed session pool"), "fixed-pool Settings copy missing");
+  assert((await page.locator('[data-session-action="delete"]').count()) === 0, "fixed pool exposed delete controls");
+  assert((await page.locator("#createSessionButton").count()) === 0, "fixed pool exposed create controls");
   await page.locator(`[data-session-key="${firstKey}"] [data-session-action="detach"]`).click();
   await page.waitForFunction((key) => document.querySelector(`[data-session-key="${key}"]`)?.textContent?.includes("Free"), firstKey);
-  await page.locator(`[data-session-key="${createdKey}"] [data-session-action="delete"]`).click();
-  await page.waitForFunction(() => document.querySelectorAll(".settings-session-row").length === 1);
+  assert(sessionMutationRequests === 0, "Settings attempted to create or delete a fixed-pool session");
   await checkNoHorizontalOverflow(page, "settings session management");
   await page.screenshot({ path: new URL("mobile-settings-session-management.png", artifactsDir).pathname, fullPage: true });
+  await page.locator(`[data-session-key="${secondKey}"] [data-session-action="open"]`).click();
+  await page.waitForFunction((key) => document.querySelector("#sessionSelect")?.value === key, secondKey);
   await page.unrouteAll({ behavior: "ignoreErrors" });
   await context.close();
 }

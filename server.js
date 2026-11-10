@@ -14,17 +14,33 @@ const publicDir = resolve(__dirname, "public");
 const dataDir = resolve(__dirname, "data");
 const auditLogPath = join(dataDir, "audit-log.jsonl");
 const appSessionStatePath = join(dataDir, "session-state.json");
-const deletedSessionsDir = join(dataDir, "deleted-sessions");
 
 const host = process.env.HOST || "127.0.0.1";
 const port = Number.parseInt(process.env.PORT || "8787", 10);
 const authToken = process.env.MOBILE_STUDIO_TOKEN || "";
 const openclawBin = process.env.OPENCLAW_BIN || "/home/nicola-rota/.npm-global/bin/openclaw";
-const openclawSessionsDir =
-  process.env.OPENCLAW_SESSIONS_DIR || "/home/nicola-rota/.openclaw/agents/main/sessions";
-const openclawSessionsIndex = join(openclawSessionsDir, "sessions.json");
 const defaultLimit = 80;
 const maxChars = 4000;
+const sessionPoolSizeMin = 1;
+const sessionPoolSizeMax = 20;
+
+function boundedIntegerEnv(name, fallback, min, max) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  if (!/^[0-9]+$/.test(raw)) throw new Error(`${name} must be an integer from ${min} to ${max}.`);
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}.`);
+  }
+  return value;
+}
+
+const sessionPoolSize = boundedIntegerEnv(
+  "MOBILE_STUDIO_SESSION_POOL_SIZE",
+  5,
+  sessionPoolSizeMin,
+  sessionPoolSizeMax,
+);
 const fileRoot = resolve(process.env.MOBILE_STUDIO_FILE_ROOT || "/home/nicola-rota");
 const filePreviewLimit = 200 * 1024;
 const diffPreviewLimit = 80_000;
@@ -33,6 +49,8 @@ const uploadMaxFileBytes = Number.parseInt(process.env.MOBILE_STUDIO_MAX_UPLOAD_
 const uploadTtlMs = Number.parseInt(process.env.MOBILE_STUDIO_UPLOAD_TTL_MS || "", 10) || 7 * 24 * 60 * 60 * 1000;
 const uploadMaxAttachmentsPerMessage =
   Number.parseInt(process.env.MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE || "", 10) || 5;
+const uploadSetupDelayMs =
+  process.env.NODE_ENV === "test" ? Number.parseInt(process.env.MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS || "0", 10) || 0 : 0;
 const mountPrefixes = ["/mobile-studio"];
 
 const mimeTypes = new Map([
@@ -173,46 +191,73 @@ async function cleanupExpiredUploadsQuiet() {
 }
 
 async function saveUpload(req) {
+  let busboy = null;
+  let inputFile = null;
+  let outputFile = null;
+  let uploadDir = null;
+  let filePromise = null;
+  let failure = null;
+  let rejectFailure;
+  const failed = new Promise((_, reject) => {
+    rejectFailure = reject;
+  });
+  // A disconnect can happen while upload-root setup is still pending.
+  failed.catch(() => {});
+
+  const failOnce = (error) => {
+    if (failure) return;
+    failure = error instanceof HttpError ? error : new HttpError(400, "UPLOAD_PARSE_ERROR", error?.message || "Upload failed.");
+    req.unpipe(busboy || undefined);
+    inputFile?.destroy(failure);
+    outputFile?.destroy(failure);
+    busboy?.destroy(failure);
+    if (!req.destroyed && !req.readableEnded) req.resume();
+    rejectFailure(failure);
+  };
+  const abortUpload = () => failOnce(new HttpError(400, "UPLOAD_ABORTED", "Upload was interrupted."));
+  const requestError = (error) => failOnce(new HttpError(400, "UPLOAD_ABORTED", error?.message || "Upload was interrupted."));
+  req.once("aborted", abortUpload);
+  req.once("error", requestError);
+
+  if (req.aborted || req.destroyed) abortUpload();
   const contentLength = Number(req.headers["content-length"] || 0);
   if (contentLength && contentLength > uploadMaxFileBytes + 1024 * 1024) {
-    throw new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`);
+    failOnce(new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`));
   }
-
-  await mkdir(uploadRoot, { recursive: true });
-  cleanupExpiredUploadsQuiet().catch(() => {});
-
-  let busboy;
   try {
+    const setup = (async () => {
+      if (uploadSetupDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, uploadSetupDelayMs));
+      await mkdir(uploadRoot, { recursive: true });
+    })();
+    await Promise.race([setup, failed]);
+    cleanupExpiredUploadsQuiet().catch(() => {});
+    if (failure) throw failure;
     busboy = Busboy({
       headers: req.headers,
       limits: {
         files: 1,
-        fileSize: uploadMaxFileBytes,
+        // Busboy marks a stream truncated when this threshold is reached. Using
+        // max + 1 makes the documented maximum inclusive without buffering.
+        fileSize: uploadMaxFileBytes + 1,
       },
     });
   } catch (error) {
+    req.off("aborted", abortUpload);
+    req.off("error", requestError);
+    if (failure) throw failure;
     throw new HttpError(400, "UPLOAD_PARSE_ERROR", error.message);
   }
   let fileSeen = false;
-  let filePromise = null;
-  let uploadDir = null;
-  let inputFile = null;
-  let uploadError = null;
-  const abortUpload = () => busboy.destroy(new HttpError(400, "UPLOAD_ABORTED", "Upload was interrupted."));
-  req.once("aborted", abortUpload);
-  req.once("error", abortUpload);
 
   const parsed = new Promise((resolveParsed, rejectParsed) => {
     busboy.on("file", (field, file, info) => {
-      // A rejected field can also emit an error on malformed multipart input.
-      file.on("error", () => {});
+      file.on("error", (error) => failOnce(error));
       if (field !== "file" || fileSeen) {
-        file.resume();
+        failOnce(new HttpError(400, fileSeen ? "TOO_MANY_FILES" : "FILE_REQUIRED", "Upload field `file` is required."));
         return;
       }
       fileSeen = true;
       inputFile = file;
-      // The error listener also covers parsing failures while mkdir is pending.
       filePromise = (async () => {
         const id = randomUUID();
         const originalName = safeUploadName(info.filename || "upload");
@@ -225,15 +270,25 @@ async function saveUpload(req) {
         let tooLarge = false;
         try {
           await mkdir(dir, { recursive: true });
-          const output = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
+          if (failure) throw failure;
+          outputFile = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
           file.on("data", (chunk) => {
             size += chunk.length;
+            if (size > uploadMaxFileBytes) {
+              tooLarge = true;
+              failOnce(
+                new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
+              );
+            }
           });
           file.on("limit", () => {
             tooLarge = true;
+            failOnce(
+              new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
+            );
           });
-          await pipeline(file, output);
-          if (tooLarge || file.truncated) {
+          await pipeline(file, outputFile);
+          if (tooLarge || file.truncated || size > uploadMaxFileBytes) {
             throw new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`);
           }
           const manifest = {
@@ -254,23 +309,24 @@ async function saveUpload(req) {
           throw new HttpError(500, "UPLOAD_FAILED", error instanceof Error ? error.message : "Upload failed.");
         }
       })();
-      // Observe write failures immediately, even if the parser has not finished.
       filePromise.catch((error) => {
-        uploadError ||= error;
-        busboy.destroy(error);
+        failOnce(error);
       });
     });
 
     busboy.on("filesLimit", () => {
-      uploadError ||= new HttpError(400, "TOO_MANY_FILES", "Upload one file at a time.");
+      failOnce(new HttpError(400, "TOO_MANY_FILES", "Upload one file at a time."));
     });
-    busboy.on("error", (error) => rejectParsed(new HttpError(400, "UPLOAD_PARSE_ERROR", error.message)));
+    busboy.on("error", (error) => {
+      failOnce(error);
+      rejectParsed(failure);
+    });
     busboy.on("finish", resolveParsed);
     req.pipe(busboy);
   });
   try {
-    await parsed;
-    if (uploadError) throw uploadError;
+    await Promise.race([parsed, failed]);
+    if (failure) throw failure;
     if (!filePromise) throw new HttpError(400, "FILE_REQUIRED", "Upload field `file` is required.");
     const manifest = await filePromise;
     await writeAuditEventQuiet(auditLogPath, "attachment_upload", {
@@ -281,15 +337,15 @@ async function saveUpload(req) {
     });
     return manifest;
   } catch (error) {
-    const failure = uploadError || error;
     inputFile?.destroy();
+    outputFile?.destroy();
     await filePromise?.catch(() => {});
     if (uploadDir) await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
-    throw failure;
+    throw failure || error;
   } finally {
     req.unpipe(busboy);
     req.off("aborted", abortUpload);
-    req.off("error", abortUpload);
+    req.off("error", requestError);
   }
 }
 
@@ -999,29 +1055,28 @@ function timestampMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-async function readLocalSessionsIndex() {
-  const raw = await readFile(openclawSessionsIndex, "utf8");
-  const parsed = JSON.parse(raw);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
-  return new Map(Object.entries(parsed));
-}
-
-async function writeLocalSessionsIndex(index) {
-  await mkdir(openclawSessionsDir, { recursive: true });
-  const tmp = `${openclawSessionsIndex}.${process.pid}.${Date.now()}.tmp`;
-  const payload = JSON.stringify(Object.fromEntries(index), null, 2);
-  await writeFile(tmp, `${payload}\n`, { mode: 0o600 });
-  await rename(tmp, openclawSessionsIndex);
-}
-
 function normalizeAppSessionState(raw) {
   const state = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const projectBindings =
     state.projectBindings && typeof state.projectBindings === "object" && !Array.isArray(state.projectBindings)
       ? state.projectBindings
       : {};
+  const seenPoolKeys = new Set();
+  const poolEntries = (Array.isArray(state.poolEntries) ? state.poolEntries : [])
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .map((entry) => ({
+      key: typeof entry.key === "string" ? entry.key.trim() : "",
+      displayName: typeof entry.displayName === "string" ? entry.displayName.trim().slice(0, 80) : "",
+      createdAt: typeof entry.createdAt === "string" ? entry.createdAt : "",
+    }))
+    .filter((entry) => {
+      if (!entry.key || seenPoolKeys.has(entry.key)) return false;
+      seenPoolKeys.add(entry.key);
+      return true;
+    });
   return {
-    version: 1,
+    version: 2,
+    poolEntries,
     projectBindings: Object.fromEntries(
       Object.entries(projectBindings)
         .filter(([sessionKey, projectPath]) => typeof sessionKey === "string" && typeof projectPath === "string")
@@ -1040,16 +1095,71 @@ async function readAppSessionState() {
 
 async function writeAppSessionState(state) {
   await mkdir(dataDir, { recursive: true });
-  const tmp = `${appSessionStatePath}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${appSessionStatePath}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tmp, `${JSON.stringify(normalizeAppSessionState(state), null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, appSessionStatePath);
 }
 
-function withSessionProjectBindings(sessions, appState) {
-  return sessions.map((session) => ({
-    ...session,
-    projectPath: appState.projectBindings[session.key] || "",
+let appSessionStateWork = Promise.resolve();
+
+function withAppSessionStateLock(work) {
+  const result = appSessionStateWork.then(work, work);
+  appSessionStateWork = result.catch(() => {});
+  return result;
+}
+
+function mobileStudioSessionName(index) {
+  return `Mobile Studio ${index}`;
+}
+
+function mobileStudioSessionKey(index) {
+  return `agent:main:mobile-studio:session:pool-${index}`;
+}
+
+function completePoolEntries(state) {
+  const now = new Date().toISOString();
+  const poolEntries = state.poolEntries.map((entry, index) => ({
+    ...entry,
+    displayName: entry.displayName || mobileStudioSessionName(index + 1),
+    createdAt: entry.createdAt || now,
   }));
+  const knownKeys = new Set(poolEntries.map((entry) => entry.key));
+
+  if (poolEntries.length === 0) {
+    for (const key of Object.keys(state.projectBindings)) {
+      if (!key.startsWith("agent:main:mobile-studio:session:") || knownKeys.has(key)) continue;
+      poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
+      knownKeys.add(key);
+      if (poolEntries.length >= sessionPoolSize) break;
+    }
+  }
+
+  for (let index = 1; poolEntries.length < sessionPoolSize; index += 1) {
+    const key = mobileStudioSessionKey(index);
+    if (knownKeys.has(key)) continue;
+    poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
+    knownKeys.add(key);
+  }
+
+  return { ...state, poolEntries };
+}
+
+async function ensureAppSessionPool() {
+  return withAppSessionStateLock(async () => {
+    const previous = await readAppSessionState();
+    const completed = completePoolEntries(previous);
+    if (JSON.stringify(completed) !== JSON.stringify(previous)) await writeAppSessionState(completed);
+    return completed;
+  });
+}
+
+function activePoolEntries(state) {
+  return state.poolEntries.slice(0, sessionPoolSize);
+}
+
+async function isActivePoolSession(sessionKey) {
+  const state = await ensureAppSessionPool();
+  return activePoolEntries(state).some((entry) => entry.key === sessionKey);
 }
 
 async function normalizeProjectBindingPath(projectPath) {
@@ -1061,72 +1171,20 @@ async function normalizeProjectBindingPath(projectPath) {
   return repo.rootDisplayPath;
 }
 
-function mobileStudioSessionName(index) {
-  return `Mobile Studio ${index}`;
-}
-
-function mobileStudioSessionKey(id) {
-  return `agent:main:mobile-studio:session:${id}`;
-}
-
-async function createMobileStudioSession(req) {
-  const body = await readJson(req);
-  const name = String(body.name || "").trim().slice(0, 80);
-  const index = await readLocalSessionsIndex();
-  const id = randomUUID();
-  const sessionId = randomUUID();
-  const now = Date.now();
-  const sessionKey = mobileStudioSessionKey(id);
-  const sessionFile = join(openclawSessionsDir, `${sessionId}.jsonl`);
-  const trajectoryFile = join(openclawSessionsDir, `${sessionId}.trajectory.jsonl`);
-  const displayName =
-    name ||
-    mobileStudioSessionName(
-      [...index.keys()].filter((key) => key.startsWith("agent:main:mobile-studio:session:")).length + 1,
-    );
-  const entry = {
-    sessionId,
-    agentId: "main",
-    kind: "mobile-studio",
-    chatType: "mobile-studio",
-    displayName,
-    subject: displayName,
-    status: "done",
-    origin: {
-      label: displayName,
-      provider: "mobile-studio",
-      surface: "mobile-studio",
-      chatType: "session",
-      from: "mobile-studio",
-      to: "agent:main",
-      accountId: "local",
-    },
-    sessionFile,
-    trajectoryFile,
-    createdAt: now,
-    updatedAt: now,
-    lastInteractionAt: now,
-  };
-  index.set(sessionKey, entry);
-  await mkdir(openclawSessionsDir, { recursive: true });
-  await writeFile(sessionFile, "", { flag: "wx", mode: 0o600 });
-  await writeFile(trajectoryFile, "", { flag: "wx", mode: 0o600 });
-  await writeLocalSessionsIndex(index);
-  await writeAuditEventQuiet(auditLogPath, "session_create", { sessionKey });
-  return { ok: true, session: { ...normalizeLocalSession(sessionKey, entry), hasLocalHistory: false, projectPath: "" } };
-}
-
 async function setSessionProject(req) {
   const body = await readJson(req);
   const sessionKey = String(body.sessionKey || "").trim();
   const projectPath = await normalizeProjectBindingPath(body.projectPath || "");
   if (!sessionKey) return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
-  const index = await readLocalSessionsIndex();
-  if (!index.has(sessionKey)) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Session not found." };
-  const appState = await readAppSessionState();
-  if (!projectPath) delete appState.projectBindings[sessionKey];
-  else appState.projectBindings[sessionKey] = projectPath;
-  await writeAppSessionState(appState);
+  const updated = await withAppSessionStateLock(async () => {
+    const appState = completePoolEntries(await readAppSessionState());
+    if (!activePoolEntries(appState).some((entry) => entry.key === sessionKey)) return false;
+    if (!projectPath) delete appState.projectBindings[sessionKey];
+    else appState.projectBindings[sessionKey] = projectPath;
+    await writeAppSessionState(appState);
+    return true;
+  });
+  if (!updated) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Pool session not found." };
   await writeAuditEventQuiet(auditLogPath, projectPath ? "session_project_attach" : "session_project_detach", {
     sessionKey,
     projectPath,
@@ -1134,342 +1192,60 @@ async function setSessionProject(req) {
   return { ok: true, sessionKey, projectPath };
 }
 
-async function moveIfExists(source, targetDir) {
-  if (!source) return;
-  const sourcePath = resolve(source);
-  const sessionsRoot = resolve(openclawSessionsDir);
-  if (sourcePath !== sessionsRoot && !sourcePath.startsWith(`${sessionsRoot}${sep}`)) return;
-  try {
-    await stat(sourcePath);
-  } catch {
-    return;
-  }
-  await mkdir(targetDir, { recursive: true });
-  const targetPath = join(targetDir, basename(sourcePath));
-  await rename(sourcePath, targetPath);
-}
-
-async function deleteSession(req) {
-  const body = await readJson(req);
-  const sessionKey = String(body.sessionKey || "").trim();
-  if (!sessionKey) return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
-  const index = await readLocalSessionsIndex();
-  const entry = index.get(sessionKey);
-  if (!entry) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Session not found." };
-  const normalized = normalizeLocalSession(sessionKey, entry);
-  if (normalized.hasActiveRun) {
-    return { ok: false, status: 409, code: "SESSION_ACTIVE", message: "Stop the active run before deleting this session." };
-  }
-
-  const tombstone = join(deletedSessionsDir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${entry.sessionId || randomUUID()}`);
-  await mkdir(tombstone, { recursive: true });
-  await writeFile(join(tombstone, "session-entry.json"), `${JSON.stringify({ sessionKey, entry }, null, 2)}\n`, { mode: 0o600 });
-  await Promise.all([
-    moveIfExists(entry.sessionFile, tombstone),
-    moveIfExists(entry.trajectoryFile, tombstone),
-    entry.sessionFile ? moveIfExists(`${entry.sessionFile}.codex-app-server.json`, tombstone) : Promise.resolve(),
-    entry.sessionId ? moveIfExists(join(openclawSessionsDir, `${entry.sessionId}.trajectory-path.json`), tombstone) : Promise.resolve(),
-  ]);
-
-  index.delete(sessionKey);
-  await writeLocalSessionsIndex(index);
-  const appState = await readAppSessionState();
-  delete appState.projectBindings[sessionKey];
-  await writeAppSessionState(appState);
-  await writeAuditEventQuiet(auditLogPath, "session_delete", { sessionKey, tombstone });
-  return { ok: true, sessionKey };
-}
-
-function normalizeLocalSession(key, session) {
-  const origin = session.origin || {};
-  const status = session.status || "";
-  return {
-    key,
-    sessionId: session.sessionId || null,
-    agentId: session.agentId || key.split(":")[1] || "",
-    kind: session.kind || origin.chatType || session.chatType || "",
-    displayName: session.displayName || origin.label || session.subject || "",
-    channel: session.channel || origin.provider || origin.surface || session.lastChannel || "",
-    subject: session.subject || origin.label || "",
-    status,
-    updatedAt: session.updatedAt ?? session.lastInteractionAt ?? null,
-    model: session.model || null,
-    modelProvider: session.modelProvider || null,
-    runtime: session.agentRuntime?.id || session.runtime || null,
-    abortedLastRun: session.abortedLastRun === true,
-    hasActiveRun:
-      session.hasActiveRun === true ||
-      ["queued", "starting", "running", "waiting", "waiting_approval"].includes(String(status).toLowerCase()),
-    startedAt: session.startedAt ?? session.sessionStartedAt ?? null,
-    endedAt: session.endedAt ?? null,
-    runtimeMs: session.runtimeMs ?? null,
-    thinkingLevel: session.thinkingLevel || null,
-    effectiveFastMode: session.effectiveFastMode ?? null,
-    estimatedCostUsd: session.estimatedCostUsd ?? null,
-    totalTokens: session.totalTokens ?? null,
-    contextTokens: session.contextTokens ?? null,
-  };
-}
-
-async function listSessionsLocal() {
-  const index = await readLocalSessionsIndex();
-  const appState = await readAppSessionState();
-  const sessions = await Promise.all(
-    [...index.entries()].map(async ([key, session]) => ({
-      ...normalizeLocalSession(key, session),
-      hasLocalHistory: await hasReadableLocalHistory(session),
-    })),
-  );
-  sessions.sort((a, b) => {
-    if (a.hasLocalHistory !== b.hasLocalHistory) return a.hasLocalHistory ? -1 : 1;
-    return (timestampMs(b.updatedAt) || 0) - (timestampMs(a.updatedAt) || 0);
-  });
-  const limitedSessions = sessions.slice(0, 50);
-  return {
-    ok: true,
-    sessions: withSessionProjectBindings(limitedSessions, appState),
-    defaults: null,
-    count: limitedSessions.length,
-    source: "local",
-  };
-}
-
-function localTrajectoryPath(session) {
-  if (session?.trajectoryFile) return session.trajectoryFile;
-  if (session?.sessionFile && session.sessionFile.endsWith(".jsonl")) {
-    return session.sessionFile.replace(/\.jsonl$/, ".trajectory.jsonl");
-  }
-  if (session?.sessionId) return join(openclawSessionsDir, `${session.sessionId}.trajectory.jsonl`);
-  return "";
-}
-
-async function hasReadableLocalHistory(session) {
-  const trajectoryPath = localTrajectoryPath(session);
-  if (!trajectoryPath) return false;
-  try {
-    const info = await stat(trajectoryPath);
-    return info.isFile() && info.size > 0;
-  } catch {
-    return false;
-  }
-}
-
-function limitString(value, limit = maxChars) {
-  const text = String(value ?? "");
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n<truncated ${text.length - limit} chars>`;
-}
-
-function stringifyLimited(value, limit = maxChars) {
-  if (typeof value === "string") return limitString(value, limit);
-  if (value === undefined || value === null) return "";
-  try {
-    return limitString(JSON.stringify(value, null, 2), limit);
-  } catch {
-    return limitString(String(value), limit);
-  }
-}
-
-function sanitizeContent(content) {
-  if (typeof content === "string") return limitString(content);
-  if (Array.isArray(content)) {
-    return content.map((item) => {
-      if (typeof item === "string") return limitString(item);
-      if (!item || typeof item !== "object") return item;
-      const copy = { ...item };
-      if (typeof copy.text === "string") copy.text = limitString(copy.text);
-      if (typeof copy.content === "string") copy.content = limitString(copy.content);
-      if (copy.input && typeof copy.input === "object") copy.input = JSON.parse(JSON.stringify(copy.input));
-      if (copy.arguments && typeof copy.arguments === "object") copy.arguments = JSON.parse(JSON.stringify(copy.arguments));
-      return copy;
-    });
-  }
-  if (content && typeof content === "object") {
-    const copy = { ...content };
-    if (typeof copy.text === "string") copy.text = limitString(copy.text);
-    return copy;
-  }
-  return content;
-}
-
-function sanitizeMessage(message) {
-  if (!message || typeof message !== "object") return message;
-  return {
-    ...message,
-    content: sanitizeContent(message.content),
-  };
-}
-
-function extractPromptText(prompt) {
-  const text = String(prompt || "").trim();
-  if (!text) return "";
-  const marker = "Current user request:";
-  const markerIndex = text.lastIndexOf(marker);
-  const candidate = markerIndex >= 0 ? text.slice(markerIndex + marker.length).trim() : text;
-  const fenceMatch = candidate.match(/^```[\s\S]*?```\s*([\s\S]+)$/);
-  return limitString((fenceMatch ? fenceMatch[1] : candidate).trim());
-}
-
-function localToolCallMessage(record, lineIndex) {
-  const data = record.data || {};
-  return sanitizeMessage({
-    role: "assistant",
-    content: [
-      {
-        type: "toolCall",
-        id: data.toolCallId || data.itemId || `local-tool-${lineIndex}`,
-        name: data.name || "tool",
-        arguments: data.arguments || {},
-        input: data.arguments || {},
-      },
-    ],
-    timestamp: timestampMs(record.ts),
-    __openclaw: { seq: lineIndex, recordTimestampMs: timestampMs(record.ts), live: true },
-  });
-}
-
-function localToolResultMessage(record, lineIndex) {
-  const data = record.data || {};
-  const output = data.output ?? data.result ?? data.contentItems ?? "";
-  return sanitizeMessage({
-    role: "toolResult",
-    toolCallId: data.toolCallId || data.itemId || "",
-    toolName: data.name || "tool",
-    isError: data.isError === true || data.success === false || data.status === "error",
-    content: [
-      {
-        type: "toolResult",
-        id: data.toolCallId || data.itemId || `local-result-${lineIndex}`,
-        name: data.name || "tool",
-        toolName: data.name || "tool",
-        toolCallId: data.toolCallId || data.itemId || "",
-        content: stringifyLimited(output),
-        text: stringifyLimited(output),
-      },
-    ],
-    timestamp: timestampMs(record.ts),
-    __openclaw: { seq: lineIndex, recordTimestampMs: timestampMs(record.ts), live: true },
-  });
-}
-
-function sliceHistoryMessages(messages, limit) {
-  if (messages.length <= limit) return messages;
-  const sliced = messages.slice(-limit);
-  const latestLiveUserIndex = messages.findLastIndex(
-    (message) => message?.role === "user" && message.__openclaw?.live === true,
-  );
-  if (latestLiveUserIndex < 0 || sliced.includes(messages[latestLiveUserIndex])) return sliced;
-  return [messages[latestLiveUserIndex], ...messages.slice(-(limit - 1))];
-}
-
-async function getHistoryLocal(sessionKey, limit) {
-  const index = await readLocalSessionsIndex();
-  const session = index.get(sessionKey);
-  if (!session) throw new Error("session not found locally");
-  const trajectoryPath = localTrajectoryPath(session);
-  const sessionInfo = normalizeLocalSession(sessionKey, session);
-  if (!trajectoryPath) {
-    return {
-      ok: true,
-      sessionKey,
-      sessionId: session.sessionId || null,
-      sessionInfo,
-      messages: [],
-      defaults: null,
-      thinkingLevel: session.thinkingLevel || null,
-      source: "local",
-    };
-  }
-
-  let raw = "";
-  try {
-    raw = await readFile(trajectoryPath, "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-    return {
-      ok: true,
-      sessionKey,
-      sessionId: session.sessionId || null,
-      sessionInfo,
-      messages: [],
-      defaults: null,
-      thinkingLevel: session.thinkingLevel || null,
-      source: "local",
-    };
-  }
-  const lines = raw.split(/\r?\n/);
-  let lastCompletedLine = -1;
-  let lastCompletedRecord = null;
-  const records = [];
-  lines.forEach((line, index) => {
-    if (!line.trim()) return;
-    try {
-      const record = JSON.parse(line);
-      records.push({ record, lineIndex: index });
-      if (record.type === "model.completed" && Array.isArray(record.data?.messagesSnapshot)) {
-        lastCompletedLine = index;
-        lastCompletedRecord = record;
-      }
-    } catch {
-      // The trajectory may be read while OpenClaw is appending the last line.
-    }
-  });
-
-  const messages = Array.isArray(lastCompletedRecord?.data?.messagesSnapshot)
-    ? lastCompletedRecord.data.messagesSnapshot.map(sanitizeMessage)
-    : [];
-  const seenLivePromptTurnIds = new Set();
-
-  for (const { record, lineIndex } of records) {
-    if (lineIndex <= lastCompletedLine) continue;
-    if (record.type === "prompt.submitted") {
-      const turnId = record.data?.turnId || `line-${lineIndex}`;
-      if (seenLivePromptTurnIds.has(turnId)) continue;
-      seenLivePromptTurnIds.add(turnId);
-      const text = extractPromptText(record.data?.prompt);
-      if (text) {
-        messages.push({
-          role: "user",
-          content: text,
-          timestamp: timestampMs(record.ts),
-          __openclaw: { seq: lineIndex, recordTimestampMs: timestampMs(record.ts), live: true },
-        });
-      }
-    } else if (record.type === "tool.call") {
-      messages.push(localToolCallMessage(record, lineIndex));
-    } else if (record.type === "tool.result") {
-      messages.push(localToolResultMessage(record, lineIndex));
-    }
-  }
-
-  const sliced = sliceHistoryMessages(messages, limit);
-  return {
-    ok: true,
-    sessionKey,
-    sessionId: session.sessionId || null,
-    sessionInfo,
-    messages: sliced,
-    defaults: null,
-    thinkingLevel: session.thinkingLevel || null,
-    source: "local",
-  };
-}
-
 async function listSessions() {
+  const appState = await ensureAppSessionPool();
+  const entries = activePoolEntries(appState);
+  let result = null;
+  let gatewayError = null;
   try {
-    return await listSessionsLocal();
-  } catch {
-    const appState = await readAppSessionState();
-    const result = await gatewayCall("sessions.list", { limit: 50 }, { timeoutMs: 10000 });
-    const sessions = Array.isArray(result.sessions) ? withSessionProjectBindings(result.sessions.map(normalizeSession), appState) : [];
-    return {
-      ok: true,
-      sessions,
-      defaults: result.defaults || null,
-      count: result.count ?? sessions.length,
-      source: "gateway",
-    };
+    result = await gatewayCall("sessions.list", { limit: 200 }, { timeoutMs: 10000 });
+  } catch (error) {
+    gatewayError = error instanceof Error ? error.message : String(error);
   }
+  const gatewaySessions = new Map(
+    (Array.isArray(result?.sessions) ? result.sessions : []).map((session) => [session.key, normalizeSession(session)]),
+  );
+  const sessions = entries.map((entry) => {
+    const gatewaySession = gatewaySessions.get(entry.key);
+    return {
+      ...(gatewaySession || {
+        key: entry.key,
+        sessionId: null,
+        agentId: "main",
+        kind: "mobile-studio",
+        status: "",
+        updatedAt: null,
+        model: null,
+        modelProvider: null,
+        runtime: null,
+        abortedLastRun: false,
+        hasActiveRun: false,
+        startedAt: null,
+        endedAt: null,
+        runtimeMs: null,
+        thinkingLevel: null,
+        effectiveFastMode: null,
+        estimatedCostUsd: null,
+        totalTokens: null,
+        contextTokens: null,
+      }),
+      key: entry.key,
+      displayName: entry.displayName,
+      subject: entry.displayName,
+      materialized: Boolean(gatewaySession?.sessionId),
+      hasLocalHistory: Boolean(gatewaySession?.sessionId),
+      projectPath: appState.projectBindings[entry.key] || "",
+    };
+  });
+  return {
+    ok: true,
+    sessions,
+    defaults: result?.defaults || null,
+    count: sessions.length,
+    poolSize: sessionPoolSize,
+    source: result ? "app+gateway" : "app",
+    gatewayError,
+  };
 }
 
 async function getHistory(url) {
@@ -1479,10 +1255,8 @@ async function getHistory(url) {
   if (!sessionKey.trim()) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
   }
-  try {
-    return await getHistoryLocal(sessionKey, limit);
-  } catch {
-    // Fall back to the Gateway API for non-local or future session formats.
+  if (!(await isActivePoolSession(sessionKey))) {
+    return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Pool session not found." };
   }
   const params = {
     sessionKey,
@@ -1532,27 +1306,10 @@ async function getRunState(url) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
   }
 
-  let session = null;
-  let sessionSource = "local";
-  try {
-    const sessionsResult = await listSessionsLocal();
-    session = sessionsResult.sessions.find((item) => item.key === sessionKey) || null;
-  } catch (error) {
-    try {
-      const sessionsResult = await gatewayCall("sessions.list", { limit: 50 }, { timeoutMs: 20000, processTimeoutMs: 25000 });
-      const sessions = Array.isArray(sessionsResult.sessions) ? sessionsResult.sessions : [];
-      const gatewaySession = sessions.find((item) => item.key === sessionKey) || null;
-      session = gatewaySession ? normalizeSession(gatewaySession) : null;
-      sessionSource = "gateway";
-    } catch (gatewayError) {
-      return {
-        ok: false,
-        status: 502,
-        code: "RUN_STATE_UNAVAILABLE",
-        message: gatewayError instanceof Error ? gatewayError.message : "Could not read session state.",
-      };
-    }
-  }
+  const sessionsResult = await listSessions();
+  const session = sessionsResult.sessions.find((item) => item.key === sessionKey) || null;
+  if (!session) return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Pool session not found." };
+  const sessionSource = sessionsResult.source;
 
   const [tasksResult, approvalsResult] = includeDetails
     ? await Promise.allSettled([
@@ -1815,6 +1572,9 @@ async function sendMessage(req) {
   if (!sessionKey) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
   }
+  if (!(await isActivePoolSession(sessionKey))) {
+    return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Pool session not found." };
+  }
   if (!message && attachments.length === 0) {
     return { ok: false, status: 400, code: "MESSAGE_REQUIRED", message: "message or attachment is required." };
   }
@@ -1910,15 +1670,11 @@ async function handleApi(req, res, url) {
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/sessions") {
-      const result = await createMobileStudioSession(req);
-      if (!result.ok) sendError(res, result.status, result.code, result.message);
-      else sendJson(res, 200, result);
+      sendError(res, 405, "SESSION_POOL_FIXED", "Session creation is disabled; Mobile Studio provisions a fixed pool automatically.");
       return;
     }
     if (req.method === "DELETE" && url.pathname === "/api/sessions") {
-      const result = await deleteSession(req);
-      if (!result.ok) sendError(res, result.status, result.code, result.message);
-      else sendJson(res, 200, result);
+      sendError(res, 405, "SESSION_POOL_FIXED", "Session deletion is disabled for the fixed Mobile Studio pool.");
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/session-project") {

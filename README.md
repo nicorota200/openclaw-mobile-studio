@@ -6,8 +6,8 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 
 ## What It Does
 
-- Chat with existing OpenClaw sessions.
-- Manage Mobile Studio chat sessions from Settings.
+- Chat through a fixed pool of Mobile Studio sessions.
+- Open pool sessions and attach or detach projects from Settings.
 - See active run state and stop active runs.
 - Browse allowed files read-only.
 - Inspect Git projects, branches, commits, changes, and diffs.
@@ -65,7 +65,7 @@ PORT=8787
 MOBILE_STUDIO_TOKEN=
 MOBILE_STUDIO_FILE_ROOT=/home/your-user
 OPENCLAW_BIN=/path/to/openclaw
-OPENCLAW_SESSIONS_DIR=/path/to/.openclaw/agents/main/sessions
+MOBILE_STUDIO_SESSION_POOL_SIZE=5
 MOBILE_STUDIO_UPLOAD_DIR=./data/chat-uploads
 MOBILE_STUDIO_MAX_UPLOAD_BYTES=1073741824
 MOBILE_STUDIO_UPLOAD_TTL_MS=604800000
@@ -82,11 +82,11 @@ The service is intended to bind to loopback and sit behind a trusted private rev
 
 ## Sessions And Project Chats
 
-Mobile Studio treats sessions as a finite pool. The Settings view is the management surface:
+Mobile Studio provisions its fixed pool on the first session-list request. `MOBILE_STUDIO_SESSION_POOL_SIZE` defaults to 5 and must be an integer from 1 through 20. Pool keys and names are stored in the app-owned `data/session-state.json` and remain stable across restart. Empty slots appear immediately, even before the Gateway has a corresponding session. The first explicit user message lazily materializes that exact key through the supported Gateway `chat.send` path with `deliver:false`.
 
-- `New session` creates a local Mobile Studio session and adds it to the pool.
-- `Detach` clears the project binding from a session without deleting its history.
-- `Delete` removes the session from the active pool. Session files are moved to `data/deleted-sessions/` so the app no longer uses them, while manual recovery remains possible.
+Settings intentionally has no create or delete controls in v0.1. `Open` selects a pool slot and `Detach` clears its project binding without changing Gateway history. POST and DELETE `/api/sessions` return `405 SESSION_POOL_FIXED`.
+
+Mobile Studio does not write, replace, delete, or move the Gateway-owned session index or transcripts. Session metadata is read through `sessions.list`; a Gateway row is merged only when its key exactly matches an app-owned pool key. Existing Gateway sessions and history are otherwise left untouched.
 
 Project `Chat` does not create sessions and does not use the currently selected session by accident. It follows this order:
 
@@ -94,11 +94,13 @@ Project `Chat` does not create sessions and does not use the currently selected 
 2. Otherwise attach the project to the first session with no project binding.
 3. If every session is occupied, show an alert and leave the current view unchanged.
 
-Project bindings are stored server-side in `data/session-state.json`. The browser cache is only a startup accelerator.
+Project bindings are stored server-side in `data/session-state.json`. On migration from the v1 state shape, bound Mobile Studio keys seed the new registry before empty deterministic slots are added. Unbound legacy Gateway sessions are not adopted or deleted. If the configured size is reduced, excess registry entries and bindings stay preserved in app state but are hidden; increasing it makes preserved entries active again. The browser cache is only a startup accelerator.
 
 ## Chat Attachments
 
-The composer can upload files before sending a message. Uploads are streamed to `MOBILE_STUDIO_UPLOAD_DIR`, defaulting to `data/chat-uploads/`, and the message sent to OpenClaw includes filesystem-readable paths plus metadata. Defaults are 1 GB per file, 5 attachments per message, and 7 days before cleanup.
+The composer can upload files before sending a message. Uploads are streamed to `MOBILE_STUDIO_UPLOAD_DIR`, defaulting to `data/chat-uploads/`, and the message sent to OpenClaw includes filesystem-readable paths plus metadata. Defaults are 1 GB per file, 5 attachments per message, and 7 days before cleanup. The byte maximum is inclusive: exactly `MOBILE_STUDIO_MAX_UPLOAD_BYTES` is accepted and one byte more is rejected.
+
+Pending attachment queues are separate per session. Switching sessions neither displays nor clears another session's queue, and upload/send completion is attributed to the session where it began. Project actions never carry composer attachments implicitly and do not clear them.
 
 ## Tailscale Serve Example
 
@@ -124,7 +126,7 @@ npm run check
 npm test
 ```
 
-`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for project action prompts, audit metadata/read limits/rotation, and upload regressions. Upload tests start disposable copies of the server on OS-assigned loopback ports with temporary data and an unavailable Gateway executable. They never start the normal service or use its session store.
+`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, and streaming upload regressions. Server tests use disposable copies on OS-assigned loopback ports and never start or mutate the normal service or its session store.
 
 GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Browser tests are deliberately separate.
 
@@ -141,7 +143,7 @@ MOBILE_STUDIO_URL=http://127.0.0.1:8787/mobile-studio/ \
 CHROMIUM_PATH=/path/to/chromium npm run visual:smoke
 ```
 
-Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. The suite includes mocked send/upload/session-management interactions and a delayed Settings response regression, but it also reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements make the full suite unsuitable for generic CI without fixtures. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
+Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. The suite includes mocked send/upload/fixed-pool interactions, per-session attachment switching, project-action attachment isolation, and a delayed Settings response regression, but it also reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements make the full suite unsuitable for generic CI without fixtures. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
 
 Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; the isolated upload tests cover the stabilization's server fixes.
 

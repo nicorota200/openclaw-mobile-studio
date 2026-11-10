@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { setTimeout } from "node:timers/promises";
 
-async function startUploadServer(t) {
+async function startUploadServer(t, options = {}) {
   // Copy only application code into a disposable root: never use real runtime data.
   const dir = await mkdtemp(join(tmpdir(), "oms-upload-test-"));
   let child;
@@ -40,11 +40,13 @@ async function startUploadServer(t) {
     cwd: dir,
     env: {
       PATH: process.env.PATH,
+      NODE_ENV: "test",
       HOST: "127.0.0.1", PORT: "0",
       MOBILE_STUDIO_TOKEN: "",
       MOBILE_STUDIO_FILE_ROOT: dir,
       MOBILE_STUDIO_UPLOAD_DIR: join(dir, "uploads"),
-      MOBILE_STUDIO_MAX_UPLOAD_BYTES: "64",
+      MOBILE_STUDIO_MAX_UPLOAD_BYTES: String(options.maxBytes || 64),
+      MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS: String(options.setupDelayMs || 0),
       OPENCLAW_BIN: join(dir, "no-gateway"),
       OPENCLAW_SESSIONS_DIR: join(dir, "sessions"),
     },
@@ -64,6 +66,24 @@ async function upload(server, name, content) {
   const form = new FormData();
   form.append("file", new Blob([content], { type: "text/plain" }), name);
   return fetch(server.url, { method: "POST", body: form, signal: AbortSignal.timeout(5000) });
+}
+
+async function responseJson(response) {
+  let body = "";
+  response.setEncoding("utf8");
+  for await (const chunk of response) body += chunk;
+  return JSON.parse(body);
+}
+
+async function beginSlowMultipart(server, initialBody) {
+  const req = request(server.url, {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=fixture" },
+  });
+  req.on("error", () => {});
+  req.write(initialBody);
+  const [response] = await once(req, "response", { signal: AbortSignal.timeout(3000) });
+  return { req, response };
 }
 
 test("uploads named manifest.json retain their original bytes separately from metadata", async (t) => {
@@ -150,6 +170,58 @@ test("client disconnect cleans a partial upload and keeps the server available",
   await waitUntil(async () => (await uploads()).length === 1);
   req.destroy();
   await waitUntil(async () => (await uploads()).length === 0);
+  assert.equal((await upload(server, "small.txt", "ok")).status, 200);
+  server.assertAlive();
+});
+
+test("upload maximum is inclusive at max-1, max, and max+1 bytes", async (t) => {
+  const server = await startUploadServer(t, { maxBytes: 64 });
+  assert.equal((await upload(server, "under.bin", "x".repeat(63))).status, 200);
+  assert.equal((await upload(server, "exact.bin", "x".repeat(64))).status, 200);
+  const over = await upload(server, "over.bin", "x".repeat(65));
+  assert.equal(over.status, 413);
+  assert.equal((await over.json()).error.code, "UPLOAD_TOO_LARGE");
+  server.assertAlive();
+});
+
+test("slow oversized input is rejected before the client sends the multipart tail", async (t) => {
+  const server = await startUploadServer(t, { maxBytes: 64 });
+  const { req, response } = await beginSlowMultipart(
+    server,
+    `--fixture\r\nContent-Disposition: form-data; name="file"; filename="slow.txt"\r\n\r\n${"x".repeat(65)}`,
+  );
+  assert.equal(response.statusCode, 413);
+  assert.equal((await responseJson(response)).error.code, "UPLOAD_TOO_LARGE");
+  req.destroy();
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  server.assertAlive();
+});
+
+test("slow second-file input is rejected before the second body or final boundary", async (t) => {
+  const server = await startUploadServer(t);
+  const { req, response } = await beginSlowMultipart(
+    server,
+    '--fixture\r\nContent-Disposition: form-data; name="file"; filename="first.txt"\r\n\r\nfirst\r\n' +
+      '--fixture\r\nContent-Disposition: form-data; name="file"; filename="second.txt"\r\n\r\ns',
+  );
+  assert.equal(response.statusCode, 400);
+  assert.equal((await responseJson(response)).error.code, "TOO_MANY_FILES");
+  req.destroy();
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  server.assertAlive();
+});
+
+test("abort before upload-root setup completes settles and leaves no partial upload", async (t) => {
+  const server = await startUploadServer(t, { setupDelayMs: 200 });
+  const req = request(server.url, {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=fixture" },
+  });
+  req.on("error", () => {});
+  req.write('--fixture\r\nContent-Disposition: form-data; name="file"; filename="early.txt"\r\n\r\nearly');
+  req.destroy();
+  await setTimeout(300);
+  assert.deepEqual(await readdir(join(server.dir, "uploads")).catch(() => []), []);
   assert.equal((await upload(server, "small.txt", "ok")).status, 200);
   server.assertAlive();
 });

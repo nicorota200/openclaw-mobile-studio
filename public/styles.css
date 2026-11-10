@@ -588,6 +588,13 @@ h2 {
   text-transform: uppercase;
 }
 
+.settings-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .theme-control {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -678,11 +685,6 @@ h2 {
 
 .settings-session-actions button:disabled {
   opacity: 0.45;
-}
-
-.settings-session-actions [data-session-action="delete"] {
-  border-color: rgba(255, 107, 107, 0.45);
-  color: var(--danger);
 }
 
 .session-panel {
