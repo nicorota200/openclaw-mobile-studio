@@ -38,3 +38,14 @@ test("operations guide covers every Phase 3 lifecycle requirement", async () => 
   assert.match(guide, /npm run doctor -- --env-file/);
   assert.match(guide, /Do not enable Funnel/);
 });
+
+test("independent installation protocol preserves the Phase 4 release gate", async () => {
+  const protocol = await readFile(new URL("docs/INSTALLATION-TRIAL.md", root), "utf8");
+  assert.match(protocol, /distinct compatible Linux host/);
+  assert.match(protocol, /do not satisfy the two-host release gate/);
+  assert.match(protocol, /without editing application source/);
+  assert.match(protocol, /approximately 30 minutes/);
+  assert.match(protocol, /MOBILE_STUDIO_GIT_MODE=read/);
+  assert.match(protocol, /release candidate may be tagged only after two passing records/i);
+  assert.doesNotMatch(protocol, /nicola-rota/);
+});

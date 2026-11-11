@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { extname, resolve } from "node:path";
 import { chromium } from "playwright";
 
 const publicDir = resolve(new URL("../public/", import.meta.url).pathname);
-const chromiumPath = process.env.CHROMIUM_PATH || "/snap/bin/chromium";
+const chromiumPath = process.env.CHROMIUM_PATH || (existsSync("/snap/bin/chromium") ? "/snap/bin/chromium" : "");
 let gitMode = "read";
 
 function assert(condition, message) {
@@ -75,7 +76,11 @@ const server = createServer(async (req, res) => {
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const address = server.address();
 const baseUrl = `http://127.0.0.1:${address.port}/?view=files&path=work%2Frepos%2Fdemo&tab=changes`;
-const browser = await chromium.launch({ executablePath: chromiumPath, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
+const browser = await chromium.launch({
+  ...(chromiumPath ? { executablePath: chromiumPath } : {}),
+  headless: true,
+  args: ["--no-sandbox", "--disable-gpu"],
+});
 
 try {
   for (const mode of ["read", "write"]) {

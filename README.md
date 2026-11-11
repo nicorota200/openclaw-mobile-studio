@@ -186,7 +186,9 @@ npm run browser:fixture
 
 `check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for portable startup configuration and OpenClaw discovery, agent-specific pool behavior, pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, streaming upload regressions, and isolated Git mode API behavior. `browser:fixture` serves disposable UI/API fixtures with configurable project roots and both Git modes. These tests never require the maintainer's Gateway, repositories, filesystem layout, normal service, or session store.
 
-GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Browser tests are deliberately separate.
+GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Trusted-host browser tests remain deliberately separate.
+
+CI also performs a clean production-only install smoke on both supported Node lines and runs the portable Chromium fixture. These checks do not replace the two independent-host installation trials defined in [`docs/INSTALLATION-TRIAL.md`](docs/INSTALLATION-TRIAL.md).
 
 Trusted-host smoke test against an already running local service:
 

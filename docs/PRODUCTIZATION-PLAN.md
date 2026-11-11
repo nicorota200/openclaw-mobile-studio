@@ -8,6 +8,8 @@ Phase 2 implementation note: runtime configuration no longer contains maintainer
 
 Phase 3 implementation note: `npm run doctor` provides non-interactive human and JSON preflight output, shares runtime configuration validation, checks the deliberately narrow dependency ranges and read-only Gateway compatibility probes, and does not expose token values. `packaging/` contains the standard user-systemd unit and environment template. `docs/OPERATIONS.md` defines install, private Tailscale exposure, backup, upgrade, rollback, and recoverable uninstall procedures.
 
+Phase 4 preparation note: CI now includes a clean production-only installation smoke on every supported Node line and the isolated Chromium fixture. `docs/INSTALLATION-TRIAL.md` defines the sanitized evidence record and strictly preserves the two-independent-host gate. A release candidate remains blocked until two real compatible hosts pass without source changes.
+
 ## Release and branch policy
 
 - `main` is the stable personal/live baseline.

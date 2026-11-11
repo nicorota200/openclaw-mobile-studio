@@ -1,5 +1,6 @@
 node_modules/
 test-artifacts/
+release-artifacts/
 data/
 .env
 .env.*
