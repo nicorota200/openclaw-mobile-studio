@@ -4,6 +4,8 @@ Status: approved direction, implementation starting from the live v0.1 baseline.
 
 Phase 1 implementation note: `MOBILE_STUDIO_GIT_MODE` is server-authoritative, defaults to `read`, and requires a restart to change. The frontend reads the active non-secret mode from `/api/config`; `/api/health` reports the same value. Direct Git mutation routes remain unavailable unless the server starts in `write` mode.
 
+Phase 2 implementation note: runtime configuration no longer contains maintainer home paths. `MOBILE_STUDIO_FILE_ROOT` is explicit and required; the OpenClaw CLI is discovered through `PATH` or `OPENCLAW_BIN`; agent ID, project roots, workspace shortcut, and route base are configurable. Trusted-tailnet mode rejects non-loopback binds at startup. Portable API/unit and Chromium fixtures are separate from the explicitly named trusted-host smoke command.
+
 ## Release and branch policy
 
 - `main` is the stable personal/live baseline.

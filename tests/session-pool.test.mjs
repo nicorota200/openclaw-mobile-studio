@@ -56,7 +56,7 @@ console.log(JSON.stringify(response));
     `,
   );
 
-  async function start(poolSize = 5) {
+  async function start(poolSize = 5, { agentId = "main" } = {}) {
     const child = spawn(process.execPath, [join(dir, "start.mjs")], {
       cwd: dir,
       env: {
@@ -67,6 +67,7 @@ console.log(JSON.stringify(response));
         MOBILE_STUDIO_TOKEN: "",
         MOBILE_STUDIO_FILE_ROOT: dir,
         MOBILE_STUDIO_SESSION_POOL_SIZE: String(poolSize),
+        MOBILE_STUDIO_AGENT_ID: agentId,
         OPENCLAW_BIN: join(dir, "fake-openclaw.mjs"),
         OPENCLAW_SESSIONS_DIR: join(dir, "gateway-sessions"),
       },
@@ -133,6 +134,24 @@ test("two concurrent first lists create one stable configured pool across restar
   const afterRestart = await fetch(`${restarted.url}/api/sessions`).then((response) => response.json());
   assert.deepEqual(afterRestart.sessions.map((session) => session.key), firstKeys);
   restarted.assertAlive();
+});
+
+test("configured agent id owns a distinct pool without adopting another agent's saved entries", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const main = await fixture.start(2);
+  const mainPayload = await fetch(`${main.url}/api/sessions`).then((response) => response.json());
+  assert(mainPayload.sessions.every((session) => session.key.startsWith("agent:main:mobile-studio:session:")));
+  await main.stop();
+
+  const builder = await fixture.start(2, { agentId: "builder" });
+  const builderPayload = await fetch(`${builder.url}/api/sessions`).then((response) => response.json());
+  assert.equal(builderPayload.sessions.length, 2);
+  assert(builderPayload.sessions.every((session) => session.key.startsWith("agent:builder:mobile-studio:session:")));
+
+  const state = JSON.parse(await readFile(join(fixture.dir, "data", "session-state.json"), "utf8"));
+  assert(state.poolEntries.some((entry) => entry.key.startsWith("agent:main:mobile-studio:session:")));
+  assert(state.poolEntries.some((entry) => entry.key.startsWith("agent:builder:mobile-studio:session:")));
+  builder.assertAlive();
 });
 
 test("malformed app session state is preserved and returns an actionable API error", async (t) => {

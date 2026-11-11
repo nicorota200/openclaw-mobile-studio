@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import Busboy from "busboy";
 import { readAuditEvents, writeAuditEventQuiet } from "./lib/audit.js";
+import { loadServerConfig } from "./lib/config.js";
 import { projectActions } from "./public/project-actions.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -16,15 +17,22 @@ const dataDir = resolve(__dirname, "data");
 const auditLogPath = join(dataDir, "audit-log.jsonl");
 const appSessionStatePath = join(dataDir, "session-state.json");
 
-const host = process.env.HOST || "127.0.0.1";
-const port = Number.parseInt(process.env.PORT || "8787", 10);
-const authToken = process.env.MOBILE_STUDIO_TOKEN || "";
-const openclawBin = process.env.OPENCLAW_BIN || "/home/nicola-rota/.npm-global/bin/openclaw";
+const serverConfig = await loadServerConfig({ env: process.env, cwd: __dirname });
+const {
+  host,
+  port,
+  authToken,
+  openclawBin,
+  gitMode,
+  fileRoot,
+  agentId,
+  basePath,
+  projectRoots,
+  workspacePath,
+  sessionPoolSize,
+} = serverConfig;
 const defaultLimit = 80;
 const maxChars = 4000;
-const sessionPoolSizeMin = 1;
-const sessionPoolSizeMax = 20;
-
 function boundedIntegerEnv(name, fallback, min, max) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
@@ -36,24 +44,6 @@ function boundedIntegerEnv(name, fallback, min, max) {
   return value;
 }
 
-function gitModeEnv() {
-  const raw = process.env.MOBILE_STUDIO_GIT_MODE;
-  if (raw === undefined || raw === "") return "read";
-  if (raw === "read" || raw === "write") return raw;
-  throw new Error(
-    `MOBILE_STUDIO_GIT_MODE must be "read" or "write"; received ${JSON.stringify(raw)}. ` +
-      "Use read (the default) to block Git mutations or write to enable guarded Git actions.",
-  );
-}
-
-const sessionPoolSize = boundedIntegerEnv(
-  "MOBILE_STUDIO_SESSION_POOL_SIZE",
-  5,
-  sessionPoolSizeMin,
-  sessionPoolSizeMax,
-);
-const gitMode = gitModeEnv();
-const fileRoot = resolve(process.env.MOBILE_STUDIO_FILE_ROOT || "/home/nicola-rota");
 const filePreviewLimit = 200 * 1024;
 const diffPreviewLimit = 80_000;
 const uploadRoot = resolve(process.env.MOBILE_STUDIO_UPLOAD_DIR || join(dataDir, "chat-uploads"));
@@ -79,7 +69,7 @@ const uploadMaxTotalBytes = boundedIntegerEnv(
 const uploadMaxConcurrent = boundedIntegerEnv("MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS", 2, 1, 20);
 const uploadSetupDelayMs =
   process.env.NODE_ENV === "test" ? Number.parseInt(process.env.MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS || "0", 10) || 0 : 0;
-const mountPrefixes = ["/mobile-studio"];
+const mountPrefixes = basePath === "/" ? [] : [basePath];
 
 const mimeTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -595,15 +585,7 @@ function runOpenClaw(args, { timeoutMs = 15000 } = {}) {
   return new Promise((resolveRun, rejectRun) => {
     const child = spawn(openclawBin, args, {
       cwd: __dirname,
-      env: {
-        ...process.env,
-        PATH: [
-          "/home/nicola-rota/.npm-global/bin",
-          process.env.PATH || "",
-        ]
-          .filter(Boolean)
-          .join(":"),
-      },
+      env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -697,6 +679,10 @@ async function getHealth() {
       port,
       fileRoot,
       gitMode,
+      agentId,
+      basePath,
+      projectRoots,
+      workspacePath,
     },
     gateway: {
       health,
@@ -1033,7 +1019,6 @@ async function getGitInfo(url) {
 }
 
 async function listProjects() {
-  const projectRoots = ["projects", ".openclaw/workspace/projects"];
   const projects = [];
 
   for (const rootPath of projectRoots) {
@@ -1414,8 +1399,10 @@ function mobileStudioSessionName(index) {
 }
 
 function mobileStudioSessionKey(index) {
-  return `agent:main:mobile-studio:session:pool-${index}`;
+  return `agent:${agentId}:mobile-studio:session:pool-${index}`;
 }
+
+const mobileStudioSessionPrefix = `agent:${agentId}:mobile-studio:session:`;
 
 function completePoolEntries(state) {
   const now = new Date().toISOString();
@@ -1425,18 +1412,21 @@ function completePoolEntries(state) {
     createdAt: entry.createdAt || now,
   }));
   const knownKeys = new Set(poolEntries.map((entry) => entry.key));
+  let currentAgentEntryCount = poolEntries.filter((entry) => entry.key.startsWith(mobileStudioSessionPrefix)).length;
 
   for (const key of Object.keys(state.projectBindings)) {
-    if (!key.startsWith("agent:main:mobile-studio:session:") || knownKeys.has(key)) continue;
+    if (!key.startsWith(mobileStudioSessionPrefix) || knownKeys.has(key)) continue;
     poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
     knownKeys.add(key);
+    currentAgentEntryCount += 1;
   }
 
-  for (let index = 1; poolEntries.length < sessionPoolSize; index += 1) {
+  for (let index = 1; currentAgentEntryCount < sessionPoolSize; index += 1) {
     const key = mobileStudioSessionKey(index);
     if (knownKeys.has(key)) continue;
     poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
     knownKeys.add(key);
+    currentAgentEntryCount += 1;
   }
 
   return { ...state, poolEntries };
@@ -1452,7 +1442,7 @@ async function ensureAppSessionPool() {
 }
 
 function activePoolEntries(state) {
-  return state.poolEntries.slice(0, sessionPoolSize);
+  return state.poolEntries.filter((entry) => entry.key.startsWith(mobileStudioSessionPrefix)).slice(0, sessionPoolSize);
 }
 
 async function isActivePoolSession(sessionKey) {
@@ -1509,7 +1499,7 @@ async function listSessions() {
       ...(gatewaySession || {
         key: entry.key,
         sessionId: null,
-        agentId: "main",
+        agentId,
         kind: "mobile-studio",
         status: "",
         updatedAt: null,
@@ -1961,7 +1951,7 @@ async function sendMessage(req) {
   await writeAuditEventQuiet(auditLogPath, audit.type, {
     ...audit.meta,
     sessionKey,
-    agentId: "main",
+    agentId,
     command,
     messageLength: outboundMessage.length,
     attachmentCount: attachments.length,
@@ -1992,7 +1982,7 @@ async function abortRun(req) {
     },
     { timeoutMs: 10000 },
   );
-  await writeAuditEventQuiet(auditLogPath, "run_abort", { sessionKey, runId, agentId: "main" });
+  await writeAuditEventQuiet(auditLogPath, "run_abort", { sessionKey, runId, agentId });
   return { ok: true, result };
 }
 
@@ -2033,7 +2023,7 @@ async function handleApi(req, res, url) {
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/config") {
-      sendJson(res, 200, { ok: true, gitMode });
+      sendJson(res, 200, { ok: true, gitMode, agentId, basePath, projectRoots, workspacePath });
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/sessions") {
@@ -2194,7 +2184,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`OpenClaw Mobile Studio listening on http://${host}:${port}`);
+  console.log(`OpenClaw Mobile Studio listening on http://${host}:${port}${basePath === "/" ? "/" : `${basePath}/`}`);
   if (!authToken) {
     console.log("MOBILE_STUDIO_TOKEN is not set; API is open to loopback clients only.");
   }

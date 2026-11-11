@@ -51,7 +51,7 @@ async function startUploadServer(t, options = {}) {
       MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS: String(options.maxConcurrent || 2),
       MOBILE_STUDIO_UPLOAD_TTL_MS: String(options.ttlMs || 60_000),
       MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS: String(options.setupDelayMs || 0),
-      OPENCLAW_BIN: join(dir, "no-gateway"),
+      OPENCLAW_BIN: "/bin/false",
       OPENCLAW_SESSIONS_DIR: join(dir, "sessions"),
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],

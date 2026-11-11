@@ -79,7 +79,7 @@ process.exit(result.status ?? 1);
     { mode: 0o755 },
   );
 
-  function spawnServer(gitMode) {
+  function spawnServer(gitMode, envOverrides = {}) {
     const env = {
       PATH: `${bin}:${process.env.PATH}`,
       NODE_ENV: "test",
@@ -88,6 +88,7 @@ process.exit(result.status ?? 1);
       MOBILE_STUDIO_TOKEN: "",
       MOBILE_STUDIO_FILE_ROOT: dir,
       OPENCLAW_BIN: "/bin/false",
+      ...envOverrides,
     };
     if (gitMode !== undefined) env.MOBILE_STUDIO_GIT_MODE = gitMode;
     const child = spawn(process.execPath, [join(dir, "start.mjs")], {
@@ -103,8 +104,8 @@ process.exit(result.status ?? 1);
     return { child, errors: () => errors };
   }
 
-  async function start(gitMode) {
-    const running = spawnServer(gitMode);
+  async function start(gitMode, envOverrides) {
+    const running = spawnServer(gitMode, envOverrides);
     const [address] = await once(running.child, "message", { signal: AbortSignal.timeout(5000) });
     return {
       ...running,
@@ -180,6 +181,27 @@ test("invalid Git mode fails startup with an actionable error", async (t) => {
   assert.notEqual(code, 0);
   assert.match(running.errors(), /MOBILE_STUDIO_GIT_MODE must be "read" or "write"/);
   assert.match(running.errors(), /received "enabled"/);
+});
+
+test("configured base path mounts the API and exposes portable non-secret settings", async (t) => {
+  const fixture = await prepareGitModeServer(t);
+  const server = await fixture.start("read", {
+    MOBILE_STUDIO_BASE_PATH: "/studio/",
+    MOBILE_STUDIO_AGENT_ID: "builder",
+    MOBILE_STUDIO_PROJECT_ROOTS: "repos,workspace/projects",
+    MOBILE_STUDIO_WORKSPACE_PATH: "workspace",
+  });
+  const response = await fetch(`${server.url}/studio/api/config`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    gitMode: "read",
+    agentId: "builder",
+    basePath: "/studio",
+    projectRoots: ["repos", "workspace/projects"],
+    workspacePath: "workspace",
+  });
+  server.assertAlive();
 });
 
 test("write mode preserves guarded branch, stage, unstage, commit, push, pull, and audit behavior", async (t) => {

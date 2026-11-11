@@ -19,8 +19,8 @@ function json(res, body) {
 const project = {
   ok: true,
   isRepo: true,
-  path: "projects/demo",
-  repositoryPath: "projects/demo",
+  path: "work/repos/demo",
+  repositoryPath: "work/repos/demo",
   repositoryName: "demo",
   branch: "main",
   tracking: "origin/main",
@@ -37,9 +37,11 @@ const project = {
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://fixture");
-  if (url.pathname === "/api/config") return json(res, { ok: true, gitMode });
+  if (url.pathname === "/api/config") {
+    return json(res, { ok: true, gitMode, projectRoots: ["work/repos"], workspacePath: "work" });
+  }
   if (url.pathname === "/api/files") {
-    return json(res, { ok: true, root: "/fixture", path: "projects/demo", showHidden: false, entries: [] });
+    return json(res, { ok: true, root: "/fixture", path: "work/repos/demo", showHidden: false, entries: [] });
   }
   if (url.pathname === "/api/project") return json(res, project);
   if (url.pathname.startsWith("/api/")) {
@@ -72,7 +74,7 @@ const server = createServer(async (req, res) => {
 
 await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
 const address = server.address();
-const baseUrl = `http://127.0.0.1:${address.port}/?view=files&path=projects%2Fdemo&tab=changes`;
+const baseUrl = `http://127.0.0.1:${address.port}/?view=files&path=work%2Frepos%2Fdemo&tab=changes`;
 const browser = await chromium.launch({ executablePath: chromiumPath, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
 
 try {

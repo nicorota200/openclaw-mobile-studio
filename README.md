@@ -28,7 +28,7 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 ## Requirements
 
 - Node.js 22.19 or newer.
-- An installed and configured `openclaw` CLI/Gateway on the same machine.
+- An installed and configured `openclaw` CLI/Gateway on the same machine. Put `openclaw` on the service `PATH` or set `OPENCLAW_BIN` explicitly.
 - Git installed on the server.
 - Optional for visual tests: Chromium at `/snap/bin/chromium` or set `CHROMIUM_PATH`.
 
@@ -41,7 +41,7 @@ npm install
 ## Run
 
 ```bash
-npm run dev
+MOBILE_STUDIO_FILE_ROOT=/home/your-user npm run dev
 ```
 
 Default URL:
@@ -66,7 +66,11 @@ PORT=8787
 MOBILE_STUDIO_TOKEN=
 MOBILE_STUDIO_GIT_MODE=read
 MOBILE_STUDIO_FILE_ROOT=/home/your-user
-OPENCLAW_BIN=/path/to/openclaw
+MOBILE_STUDIO_AGENT_ID=main
+MOBILE_STUDIO_PROJECT_ROOTS=projects,.openclaw/workspace/projects
+MOBILE_STUDIO_WORKSPACE_PATH=.openclaw/workspace
+MOBILE_STUDIO_BASE_PATH=/mobile-studio
+OPENCLAW_BIN=openclaw
 MOBILE_STUDIO_SESSION_POOL_SIZE=5
 MOBILE_STUDIO_UPLOAD_DIR=./data/chat-uploads
 MOBILE_STUDIO_MAX_UPLOAD_BYTES=1073741824
@@ -75,6 +79,18 @@ MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS=2
 MOBILE_STUDIO_UPLOAD_TTL_MS=604800000
 MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE=5
 ```
+
+`MOBILE_STUDIO_FILE_ROOT` is required and must name an existing readable directory. It is the filesystem boundary for browsing, project discovery, and Git operations. The server fails at startup instead of silently falling back to a maintainer-specific or broad home directory.
+
+`OPENCLAW_BIN` is optional when `openclaw` is executable through the process `PATH`. When set, it may be an executable path or command name. Startup fails with an actionable error when the CLI cannot be found or executed.
+
+`MOBILE_STUDIO_AGENT_ID` defaults to `main` and selects the OpenClaw agent namespace used by the fixed Mobile Studio session pool. Changing it creates or reuses a separate pool for that agent; saved entries for other agents remain preserved but inactive.
+
+`MOBILE_STUDIO_PROJECT_ROOTS` is a comma-separated list of directories relative to `MOBILE_STUDIO_FILE_ROOT`. Mobile Studio scans their immediate child directories for Git repositories. `MOBILE_STUDIO_WORKSPACE_PATH` controls the optional Workspace shortcut and may be set to an empty string to hide it. All configured paths must remain inside the file root.
+
+`MOBILE_STUDIO_BASE_PATH` defaults to `/mobile-studio`, accepts an absolute URL path, and controls the private proxy route. Root access remains available locally. PWA scope and client API URLs follow the path where the frontend is served.
+
+Trusted-tailnet mode accepts only loopback `HOST` values (`127.0.0.1`, `::1`, or `localhost`). Public or wildcard binds fail startup; use Tailscale Serve as the private network edge.
 
 `MOBILE_STUDIO_TOKEN` is optional. If set, API requests must use:
 
@@ -143,7 +159,7 @@ https://your-node.your-tailnet.ts.net/mobile-studio/
 
 ## Tests
 
-Local quality baseline (no Gateway or browser required):
+Portable local quality baseline (no Gateway or maintainer filesystem required):
 
 ```bash
 npm ci --ignore-scripts
@@ -152,14 +168,14 @@ npm test
 npm run browser:fixture
 ```
 
-`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, streaming upload regressions, and isolated Git mode API behavior. `browser:fixture` serves disposable read/write UI fixtures and checks mode labeling and write-control visibility with local Chromium. These tests never start or mutate the normal service or its session store.
+`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for portable startup configuration and OpenClaw discovery, agent-specific pool behavior, pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, streaming upload regressions, and isolated Git mode API behavior. `browser:fixture` serves disposable UI/API fixtures with configurable project roots and both Git modes. These tests never require the maintainer's Gateway, repositories, filesystem layout, normal service, or session store.
 
 GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Browser tests are deliberately separate.
 
-Visual smoke test against an already running local service:
+Trusted-host smoke test against an already running local service:
 
 ```bash
-npm run visual:smoke
+npm run browser:host-smoke
 ```
 
 With an explicit URL and Chromium:
@@ -169,7 +185,7 @@ MOBILE_STUDIO_URL=http://127.0.0.1:8787/mobile-studio/ \
 CHROMIUM_PATH=/path/to/chromium npm run visual:smoke
 ```
 
-Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. The suite includes mocked send/upload/fixed-pool interactions, per-session attachment switching, project-action attachment isolation, and a delayed Settings response regression, but it also reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements make the full suite unsuitable for generic CI without fixtures. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
+`visual:smoke` remains a compatibility alias for `browser:host-smoke`. Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. Unlike `browser:fixture`, this trusted-host suite reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the maintainer-host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements intentionally keep it outside generic CI. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
 
 Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; isolated server tests cover backend behavior.
 

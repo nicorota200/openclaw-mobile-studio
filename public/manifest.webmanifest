@@ -1,7 +1,8 @@
 {
   "name": "OpenClaw Mobile Studio",
   "short_name": "Mobile Studio",
-  "start_url": "/",
+  "start_url": ".",
+  "scope": ".",
   "display": "standalone",
   "background_color": "#111820",
   "theme_color": "#111820",

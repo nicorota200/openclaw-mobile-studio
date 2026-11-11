@@ -40,7 +40,10 @@ const state = {
   chatProjectPath: "",
   chatProjectInfo: null,
   chatProjectExpanded: false,
-  fileRoot: "/home/nicola-rota",
+  fileRoot: "",
+  projectRoots: [],
+  primaryProjectRoot: "",
+  workspacePath: "",
   selectedFilePath: "",
   fileScreen: "browser",
   pushedReaderHistory: false,
@@ -567,19 +570,15 @@ function parentPath(path) {
 }
 
 function isProjectsPath(path = state.filePath) {
-  return (
-    path === "projects" ||
-    path.startsWith("projects/") ||
-    path === ".openclaw/workspace/projects" ||
-    path.startsWith(".openclaw/workspace/projects/")
-  );
+  return state.projectRoots.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
 function projectPathFromFilePath(path = state.filePath) {
-  const parts = String(path || "").split("/").filter(Boolean);
-  if (parts[0] === "projects" && parts[1]) return `projects/${parts[1]}`;
-  if (parts[0] === ".openclaw" && parts[1] === "workspace" && parts[2] === "projects" && parts[3]) {
-    return `.openclaw/workspace/projects/${parts[3]}`;
+  const value = String(path || "");
+  for (const root of [...state.projectRoots].sort((left, right) => right.length - left.length)) {
+    if (!value.startsWith(`${root}/`)) continue;
+    const projectName = value.slice(root.length + 1).split("/")[0];
+    if (projectName) return `${root}/${projectName}`;
   }
   return "";
 }
@@ -2458,6 +2457,15 @@ async function refreshAll({ quiet = false } = {}) {
 async function loadRuntimeConfig() {
   const config = await api("/api/config");
   state.gitMode = config.gitMode === "write" ? "write" : "read";
+  state.projectRoots = Array.isArray(config.projectRoots) ? config.projectRoots.filter(Boolean) : [];
+  state.primaryProjectRoot = state.projectRoots[0] || "";
+  state.workspacePath = typeof config.workspacePath === "string" ? config.workspacePath : "";
+  els.projectsShortcut.hidden = !state.primaryProjectRoot;
+  els.workspaceShortcut.hidden = !state.workspacePath;
+  for (const action of els.homeActions) {
+    if (action.dataset.homeAction === "projects") action.hidden = !state.primaryProjectRoot;
+    if (action.dataset.homeAction === "workspace") action.hidden = !state.workspacePath;
+  }
   renderProjectWorkbench();
 }
 
@@ -3131,10 +3139,10 @@ for (const action of els.homeActions) {
       await refreshAll();
     } else if (name === "projects") {
       setView("files");
-      await navigateFiles("projects");
+      await navigateFiles(state.primaryProjectRoot);
     } else if (name === "workspace") {
       setView("files");
-      await navigateFiles(".openclaw/workspace");
+      await navigateFiles(state.workspacePath);
     }
   });
 }
@@ -3143,9 +3151,9 @@ els.filesRefreshButton.addEventListener("click", () => loadFiles().catch((error)
 
 els.gitButton.addEventListener("click", openGit);
 
-els.projectsShortcut.addEventListener("click", () => navigateFiles("projects"));
+els.projectsShortcut.addEventListener("click", () => navigateFiles(state.primaryProjectRoot));
 
-els.workspaceShortcut.addEventListener("click", () => navigateFiles(".openclaw/workspace"));
+els.workspaceShortcut.addEventListener("click", () => navigateFiles(state.workspacePath));
 
 els.projectChatButton.addEventListener("click", () => {
   attachCurrentProjectToChat().catch((error) => setStatus(error.message, "error"));
