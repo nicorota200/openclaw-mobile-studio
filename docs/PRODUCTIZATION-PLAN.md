@@ -6,6 +6,8 @@ Phase 1 implementation note: `MOBILE_STUDIO_GIT_MODE` is server-authoritative, d
 
 Phase 2 implementation note: runtime configuration no longer contains maintainer home paths. `MOBILE_STUDIO_FILE_ROOT` is explicit and required; the OpenClaw CLI is discovered through `PATH` or `OPENCLAW_BIN`; agent ID, project roots, workspace shortcut, and route base are configurable. Trusted-tailnet mode rejects non-loopback binds at startup. Portable API/unit and Chromium fixtures are separate from the explicitly named trusted-host smoke command.
 
+Phase 3 implementation note: `npm run doctor` provides non-interactive human and JSON preflight output, shares runtime configuration validation, checks the deliberately narrow dependency ranges and read-only Gateway compatibility probes, and does not expose token values. `packaging/` contains the standard user-systemd unit and environment template. `docs/OPERATIONS.md` defines install, private Tailscale exposure, backup, upgrade, rollback, and recoverable uninstall procedures.
+
 ## Release and branch policy
 
 - `main` is the stable personal/live baseline.

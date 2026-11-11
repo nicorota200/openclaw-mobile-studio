@@ -12,6 +12,7 @@
   "scripts": {
     "dev": "node server.js",
     "start": "NODE_ENV=production node server.js",
+    "doctor": "node scripts/doctor.mjs",
     "check": "node scripts/check.mjs",
     "test": "node --test tests/*.test.mjs",
     "browser:fixture": "node tests/git-mode-browser.mjs",
@@ -19,7 +20,7 @@
     "visual:smoke": "npm run browser:host-smoke"
   },
   "engines": {
-    "node": ">=22.19"
+    "node": ">=22.19 <25"
   },
   "devDependencies": {
     "playwright": "^1.61.1"

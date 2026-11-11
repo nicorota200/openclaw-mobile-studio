@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenClaw Mobile Studio
+Documentation=https://github.com/nicorota200/openclaw-mobile-studio
+After=network-online.target openclaw-gateway.service tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/openclaw-mobile-studio/app
+Environment=NODE_ENV=production
+EnvironmentFile=%h/.config/openclaw-mobile-studio/env
+ExecStart=/usr/bin/env npm run start
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

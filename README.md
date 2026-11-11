@@ -27,12 +27,16 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 
 ## Requirements
 
-- Node.js 22.19 or newer.
-- An installed and configured `openclaw` CLI/Gateway on the same machine. Put `openclaw` on the service `PATH` or set `OPENCLAW_BIN` explicitly.
-- Git installed on the server.
+- Linux with a user systemd manager.
+- Node.js 22.19 through 24.x.
+- OpenClaw 2026.9.4 through 2026.9.x, with CLI and Gateway on the same machine.
+- Git 2.39 or newer.
+- Tailscale 1.70 or newer, connected to a private tailnet.
 - Optional for visual tests: Chromium at `/snap/bin/chromium` or set `CHROMIUM_PATH`.
 
-## Install
+These are the deliberately narrow first-product ranges. Run `npm run doctor` rather than assuming a later OpenClaw Gateway is compatible.
+
+## Quick development install
 
 ```bash
 npm install
@@ -56,6 +60,8 @@ Production-style start:
 npm start
 ```
 
+For the supported user-systemd installation, Tailscale Serve setup, backup, upgrade, rollback, and uninstall procedures, follow [the operations guide](docs/OPERATIONS.md).
+
 ## Configuration
 
 Environment variables:
@@ -70,7 +76,7 @@ MOBILE_STUDIO_AGENT_ID=main
 MOBILE_STUDIO_PROJECT_ROOTS=projects,.openclaw/workspace/projects
 MOBILE_STUDIO_WORKSPACE_PATH=.openclaw/workspace
 MOBILE_STUDIO_BASE_PATH=/mobile-studio
-OPENCLAW_BIN=openclaw
+OPENCLAW_BIN=/absolute/path/from-command-v-openclaw
 MOBILE_STUDIO_SESSION_POOL_SIZE=5
 MOBILE_STUDIO_UPLOAD_DIR=./data/chat-uploads
 MOBILE_STUDIO_MAX_UPLOAD_BYTES=1073741824
@@ -91,6 +97,16 @@ MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE=5
 `MOBILE_STUDIO_BASE_PATH` defaults to `/mobile-studio`, accepts an absolute URL path, and controls the private proxy route. Root access remains available locally. PWA scope and client API URLs follow the path where the frontend is served.
 
 Trusted-tailnet mode accepts only loopback `HOST` values (`127.0.0.1`, `::1`, or `localhost`). Public or wildcard binds fail startup; use Tailscale Serve as the private network edge.
+
+## Doctor
+
+Run the non-interactive preflight with the same environment file used by systemd:
+
+```bash
+npm run doctor -- --env-file "$HOME/.config/openclaw-mobile-studio/env"
+```
+
+Use `npm run --silent doctor -- --env-file PATH --json` for machine-readable results without npm's command banner. Doctor checks supported versions, safe configuration, data permissions, read-only Gateway probes, Tailscale connectivity/Serve state, and the user systemd manager. It never prints the configured Mobile Studio token.
 
 `MOBILE_STUDIO_TOKEN` is optional. If set, API requests must use:
 
