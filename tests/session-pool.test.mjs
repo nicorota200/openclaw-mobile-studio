@@ -132,6 +132,42 @@ test("two concurrent first lists create one stable configured pool across restar
   restarted.assertAlive();
 });
 
+test("malformed app session state is preserved and returns an actionable API error", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const statePath = join(fixture.dir, "data", "session-state.json");
+  const malformed = '{"version":2,"poolEntries":';
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(statePath, malformed);
+
+  const server = await fixture.start(2);
+  const response = await fetch(`${server.url}/api/sessions`);
+  const payload = await response.json();
+
+  assert.equal(response.status, 500);
+  assert.equal(payload.error.code, "SESSION_STATE_CORRUPT");
+  assert.match(payload.error.message, /preserve.*restore.*backup/i);
+  assert.equal(await readFile(statePath, "utf8"), malformed);
+  assert.deepEqual((await readdir(join(fixture.dir, "data"))).filter((name) => name.includes(".tmp")), []);
+  server.assertAlive();
+});
+
+test("unreadable existing app session state is not treated as missing", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const statePath = join(fixture.dir, "data", "session-state.json");
+  await mkdir(statePath, { recursive: true });
+  await writeFile(join(statePath, "preserve.txt"), "do not replace");
+
+  const server = await fixture.start(2);
+  const response = await fetch(`${server.url}/api/sessions`);
+  const payload = await response.json();
+
+  assert.equal(response.status, 500);
+  assert.equal(payload.error.code, "SESSION_STATE_UNREADABLE");
+  assert.match(payload.error.message, /permissions.*backup/i);
+  assert.equal(await readFile(join(statePath, "preserve.txt"), "utf8"), "do not replace");
+  server.assertAlive();
+});
+
 test("pool bootstrap and disabled mutations never alter Gateway-owned files", async (t) => {
   const fixture = await preparePoolServer(t);
   const gatewayDir = join(fixture.dir, "gateway-sessions");
@@ -245,8 +281,13 @@ test("attention and run-state never expose external task session keys", async (t
     {
       "tasks.list": {
         tasks: [
-          { id: "pool-task", status: "running", sessionKey: poolKey },
-          { id: "external-task", status: "waiting", sessionKey: externalKey },
+          ...Array.from({ length: 8 }, (_, index) => ({
+            id: `external-task-${index + 1}`,
+            status: "waiting",
+            sessionKey: externalKey,
+            updatedAt: `2026-11-11T12:${String(index).padStart(2, "0")}:00.000Z`,
+          })),
+          { id: "pool-task", status: "running", sessionKey: poolKey, updatedAt: "2026-11-10T00:00:00.000Z" },
         ],
       },
     },
@@ -269,8 +310,8 @@ test("attention and run-state never expose external task session keys", async (t
 
   const attention = await fetch(`${server.url}/api/attention?details=1`).then((response) => response.json());
   assert.equal(attention.items.some((item) => item.id === "task:pool-task" && item.sessionKey === poolKey), true);
-  assert.equal(attention.items.some((item) => item.id === "task:external-task" || item.sessionKey === externalKey), false);
-  assert.equal(attention.recentTasks.some((task) => task.id === "external-task" || task.sessionKey === externalKey), false);
+  assert.equal(attention.items.some((item) => item.id.startsWith("task:external-task") || item.sessionKey === externalKey), false);
+  assert.equal(attention.recentTasks.some((task) => task.id.startsWith("external-task") || task.sessionKey === externalKey), false);
   assert.equal(attention.summary.activeTasks, 1);
   assert.deepEqual(attention.auditEvents[0].meta, {
     action: "review_changes",
@@ -284,9 +325,18 @@ test("attention and run-state never expose external task session keys", async (t
   assert.equal(JSON.stringify({ attention, runState }).includes(externalKey), false);
 });
 
-test("send ignores caller backing IDs and protects calculated audit metadata", async (t) => {
+test("send accepts only a bound, allowed project action and protects calculated audit metadata", async (t) => {
   const poolKey = "agent:main:mobile-studio:session:pool-1";
   const fixture = await preparePoolServer(t);
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(
+    join(fixture.dir, "data", "session-state.json"),
+    `${JSON.stringify({
+      version: 2,
+      poolEntries: [{ key: poolKey, displayName: "Mobile Studio 1", createdAt: new Date().toISOString() }],
+      projectBindings: { [poolKey]: "projects/example" },
+    })}\n`,
+  );
   const server = await fixture.start(1);
   const response = await fetch(`${server.url}/api/send`, {
     method: "POST",
@@ -327,4 +377,49 @@ test("send ignores caller backing IDs and protects calculated audit metadata", a
     action: "review_changes",
     projectPath: "projects/example",
   });
+});
+
+test("send records forged client audit types as chat_send", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const fixture = await preparePoolServer(t);
+  const server = await fixture.start(1);
+
+  for (const [index, type] of ["git_action", "branch_switch", "run_abort"].entries()) {
+    const response = await fetch(`${server.url}/api/send`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionKey: poolKey,
+        message: `forged ${type}`,
+        idempotencyKey: `forged-${index}`,
+        audit: { type, meta: { action: "push", projectPath: "projects/forged", changed: true } },
+      }),
+    });
+    assert.equal(response.status, 200);
+  }
+
+  const events = await fetch(`${server.url}/api/audit?limit=3`)
+    .then((response) => response.json())
+    .then((body) => body.events);
+  assert.deepEqual(events.map((event) => event.type), ["chat_send", "chat_send", "chat_send"]);
+  assert.equal(events.every((event) => !("action" in event.meta) && !("projectPath" in event.meta)), true);
+});
+
+test("send rejects invalid project_action semantics before calling Gateway", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const fixture = await preparePoolServer(t);
+  const server = await fixture.start(1);
+  const response = await fetch(`${server.url}/api/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionKey: poolKey,
+      message: "pretend project action",
+      audit: { type: "project_action", meta: { action: "push", projectPath: "projects/unbound" } },
+    }),
+  });
+
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "INVALID_PROJECT_ACTION_AUDIT");
+  assert.equal((await fixture.gatewayCalls()).some((call) => call.method === "chat.send"), false);
 });

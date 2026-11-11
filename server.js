@@ -3,11 +3,12 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join, normalize, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import Busboy from "busboy";
 import { readAuditEvents, writeAuditEventQuiet } from "./lib/audit.js";
+import { projectActions } from "./public/project-actions.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = resolve(__dirname, "public");
@@ -45,10 +46,26 @@ const fileRoot = resolve(process.env.MOBILE_STUDIO_FILE_ROOT || "/home/nicola-ro
 const filePreviewLimit = 200 * 1024;
 const diffPreviewLimit = 80_000;
 const uploadRoot = resolve(process.env.MOBILE_STUDIO_UPLOAD_DIR || join(dataDir, "chat-uploads"));
-const uploadMaxFileBytes = Number.parseInt(process.env.MOBILE_STUDIO_MAX_UPLOAD_BYTES || "", 10) || 1024 * 1024 * 1024;
-const uploadTtlMs = Number.parseInt(process.env.MOBILE_STUDIO_UPLOAD_TTL_MS || "", 10) || 7 * 24 * 60 * 60 * 1000;
-const uploadMaxAttachmentsPerMessage =
-  Number.parseInt(process.env.MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE || "", 10) || 5;
+const uploadMaxFileBytes = boundedIntegerEnv(
+  "MOBILE_STUDIO_MAX_UPLOAD_BYTES",
+  1024 * 1024 * 1024,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const uploadTtlMs = boundedIntegerEnv(
+  "MOBILE_STUDIO_UPLOAD_TTL_MS",
+  7 * 24 * 60 * 60 * 1000,
+  1,
+  365 * 24 * 60 * 60 * 1000,
+);
+const uploadMaxAttachmentsPerMessage = boundedIntegerEnv("MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE", 5, 1, 20);
+const uploadMaxTotalBytes = boundedIntegerEnv(
+  "MOBILE_STUDIO_MAX_TOTAL_UPLOAD_BYTES",
+  2 * 1024 * 1024 * 1024,
+  1,
+  Number.MAX_SAFE_INTEGER,
+);
+const uploadMaxConcurrent = boundedIntegerEnv("MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS", 2, 1, 20);
 const uploadSetupDelayMs =
   process.env.NODE_ENV === "test" ? Number.parseInt(process.env.MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS || "0", 10) || 0 : 0;
 const mountPrefixes = ["/mobile-studio"];
@@ -158,39 +175,182 @@ function uploadMetaPath(id) {
   return join(uploadRoot, id, "manifest.json");
 }
 
+function uploadDirectoryPath(name) {
+  const path = resolve(uploadRoot, name);
+  if (dirname(path) !== uploadRoot) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_ID", "Attachment directory is outside the upload root.");
+  }
+  return path;
+}
+
+function validateUploadManifest(manifest, id, fileInfo, { allowExpired = false } = {}) {
+  const uploadDir = uploadDirectoryPath(id);
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata is malformed.");
+  }
+  const filePath = resolve(typeof manifest.path === "string" ? manifest.path : "");
+  const expiresAt = Date.parse(manifest.expiresAt || "");
+  if (
+    manifest.id !== id ||
+    typeof manifest.name !== "string" ||
+    !manifest.name ||
+    !Number.isSafeInteger(manifest.size) ||
+    manifest.size < 0 ||
+    dirname(filePath) !== uploadDir ||
+    !Number.isFinite(expiresAt) ||
+    !fileInfo?.isFile() ||
+    fileInfo.isSymbolicLink() ||
+    fileInfo.size !== manifest.size
+  ) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata or payload is malformed.");
+  }
+  if (!allowExpired && expiresAt <= Date.now()) {
+    throw new HttpError(410, "ATTACHMENT_EXPIRED", "Attachment has expired; upload it again before sending.");
+  }
+  return { manifest, filePath, expiresAt };
+}
+
+async function loadUploadManifest(id, options) {
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(uploadMetaPath(id), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new HttpError(404, "ATTACHMENT_NOT_FOUND", "Attachment was not found; upload it again.");
+    }
+    if (error instanceof SyntaxError || error?.code === "EISDIR") {
+      throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata is malformed.");
+    }
+    throw error;
+  }
+  const uploadDir = uploadDirectoryPath(id);
+  const filePath = resolve(typeof manifest?.path === "string" ? manifest.path : "");
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || dirname(filePath) !== uploadDir) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata or payload is malformed.");
+  }
+  let fileInfo;
+  try {
+    fileInfo = await lstat(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment payload is missing.");
+    }
+    throw error;
+  }
+  return validateUploadManifest(manifest, id, fileInfo, options);
+}
+
+async function removeUploadDirectory(name) {
+  const path = uploadDirectoryPath(name);
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw new HttpError(500, "UPLOAD_STORAGE_UNAVAILABLE", `Upload directory cannot be inspected: ${error.message}`);
+  }
+  if (!info.isDirectory() || info.isSymbolicLink()) return false;
+  try {
+    await rm(path, { recursive: true, force: true });
+  } catch (error) {
+    throw new HttpError(500, "UPLOAD_STORAGE_UNAVAILABLE", `Upload directory cannot be removed: ${error.message}`);
+  }
+  return true;
+}
+
 async function readUploadManifest(id) {
   if (!/^[0-9a-f-]{36}$/i.test(String(id || ""))) {
     throw new HttpError(400, "INVALID_ATTACHMENT_ID", "Attachment id is invalid.");
   }
-  const manifest = JSON.parse(await readFile(uploadMetaPath(id), "utf8"));
-  const filePath = resolve(manifest.path || "");
-  const uploadDir = resolve(uploadRoot, id);
-  if (filePath !== uploadDir && !filePath.startsWith(`${uploadDir}${sep}`)) {
-    throw new HttpError(403, "INVALID_ATTACHMENT_PATH", "Attachment path is outside its upload directory.");
+  const loaded = await loadUploadManifest(id, { allowExpired: true });
+  if (loaded.expiresAt <= Date.now()) {
+    if (await removeUploadDirectory(id).catch(() => false)) {
+      uploadStoredBytes = Math.max(0, uploadStoredBytes - loaded.manifest.size);
+    }
+    throw new HttpError(410, "ATTACHMENT_EXPIRED", "Attachment has expired; upload it again before sending.");
   }
-  await stat(filePath);
-  return manifest;
+  return loaded.manifest;
 }
 
-async function cleanupExpiredUploadsQuiet() {
+const activeUploadDirectories = new Set();
+let uploadStoredBytes = 0;
+let uploadReservedBytes = 0;
+let uploadStorageReady = null;
+let uploadMaintenanceWork = Promise.resolve();
+let activeUploadCount = 0;
+
+function withUploadMaintenanceLock(work) {
+  const result = uploadMaintenanceWork.then(work, work);
+  uploadMaintenanceWork = result.catch(() => {});
+  return result;
+}
+
+async function cleanupUploads({ initialize = false } = {}) {
   const now = Date.now();
-  const entries = await readdir(uploadRoot, { withFileTypes: true }).catch(() => []);
-  await Promise.all(
-    entries
-      .filter((entry) => entry.isDirectory())
-      .map(async (entry) => {
-        try {
-          const manifest = JSON.parse(await readFile(join(uploadRoot, entry.name, "manifest.json"), "utf8"));
-          if (Date.parse(manifest.expiresAt || "") > now) return;
-          await rm(join(uploadRoot, entry.name), { recursive: true, force: true });
-        } catch {
-          // Ignore stale or partially written upload directories.
-        }
-      }),
-  );
+  let entries;
+  try {
+    entries = await readdir(uploadRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0;
+    throw new HttpError(500, "UPLOAD_STORAGE_UNAVAILABLE", `Upload storage cannot be read: ${error.message}`);
+  }
+  let validBytes = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink() || activeUploadDirectories.has(entry.name)) continue;
+    let loaded;
+    try {
+      loaded = await loadUploadManifest(entry.name, { allowExpired: true });
+    } catch (error) {
+      if (error instanceof HttpError && error.status < 500) {
+        await removeUploadDirectory(entry.name);
+        continue;
+      }
+      throw new HttpError(500, "UPLOAD_STORAGE_UNAVAILABLE", `Upload storage cannot be inspected: ${error.message}`);
+    }
+    if (loaded.expiresAt <= now) {
+      if (await removeUploadDirectory(entry.name)) {
+        if (!initialize) uploadStoredBytes = Math.max(0, uploadStoredBytes - loaded.manifest.size);
+      }
+      continue;
+    }
+    validBytes += loaded.manifest.size;
+  }
+  if (initialize) uploadStoredBytes = validBytes;
+  return validBytes;
 }
 
-async function saveUpload(req) {
+function ensureUploadStorageReady() {
+  if (!uploadStorageReady) {
+    uploadStorageReady = withUploadMaintenanceLock(() => cleanupUploads({ initialize: true })).catch((error) => {
+      uploadStorageReady = null;
+      throw error;
+    });
+  }
+  return uploadStorageReady;
+}
+
+async function prepareUploadStorage() {
+  await mkdir(uploadRoot, { recursive: true });
+  await ensureUploadStorageReady();
+  await withUploadMaintenanceLock(() => cleanupUploads());
+}
+
+function reserveUploadBytes(size) {
+  if (uploadStoredBytes + uploadReservedBytes + size > uploadMaxTotalBytes) {
+    throw new HttpError(
+      507,
+      "UPLOAD_CAPACITY_EXCEEDED",
+      `Upload storage limit is ${uploadMaxTotalBytes} bytes; remove or wait for existing attachments to expire.`,
+    );
+  }
+  uploadReservedBytes += size;
+}
+
+function releaseUploadBytes(size) {
+  uploadReservedBytes = Math.max(0, uploadReservedBytes - size);
+}
+
+async function saveUploadWithinLimits(req) {
   let busboy = null;
   let inputFile = null;
   let outputFile = null;
@@ -227,10 +387,9 @@ async function saveUpload(req) {
   try {
     const setup = (async () => {
       if (uploadSetupDelayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, uploadSetupDelayMs));
-      await mkdir(uploadRoot, { recursive: true });
+      await prepareUploadStorage();
     })();
     await Promise.race([setup, failed]);
-    cleanupExpiredUploadsQuiet().catch(() => {});
     if (failure) throw failure;
     busboy = Busboy({
       headers: req.headers,
@@ -245,6 +404,7 @@ async function saveUpload(req) {
     req.off("aborted", abortUpload);
     req.off("error", requestError);
     if (failure) throw failure;
+    if (error instanceof HttpError) throw error;
     throw new HttpError(400, "UPLOAD_PARSE_ERROR", error.message);
   }
   let fileSeen = false;
@@ -263,22 +423,32 @@ async function saveUpload(req) {
         const originalName = safeUploadName(info.filename || "upload");
         const dir = join(uploadRoot, id);
         uploadDir = dir;
+        activeUploadDirectories.add(id);
         // Keep user bytes distinct from our manifest, including for manifest.json.
         const filePath = join(dir, `file-${originalName}`);
         const createdAt = new Date();
         let size = 0;
+        let reservedSize = 0;
+        let committed = false;
         let tooLarge = false;
         try {
           await mkdir(dir, { recursive: true });
           if (failure) throw failure;
           outputFile = createWriteStream(filePath, { flags: "wx", mode: 0o600 });
           file.on("data", (chunk) => {
-            size += chunk.length;
-            if (size > uploadMaxFileBytes) {
-              tooLarge = true;
-              failOnce(
-                new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
-              );
+            try {
+              size += chunk.length;
+              if (size > uploadMaxFileBytes) {
+                tooLarge = true;
+                failOnce(
+                  new HttpError(413, "UPLOAD_TOO_LARGE", `Upload limit is ${Math.round(uploadMaxFileBytes / 1024 / 1024)} MB.`),
+                );
+                return;
+              }
+              reserveUploadBytes(chunk.length);
+              reservedSize += chunk.length;
+            } catch (error) {
+              failOnce(error);
             }
           });
           file.on("limit", () => {
@@ -302,11 +472,18 @@ async function saveUpload(req) {
             expiresAt: new Date(createdAt.getTime() + uploadTtlMs).toISOString(),
           };
           await writeFile(uploadMetaPath(id), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+          releaseUploadBytes(reservedSize);
+          uploadStoredBytes += size;
+          reservedSize = 0;
+          committed = true;
           return manifest;
         } catch (error) {
           await rm(dir, { recursive: true, force: true }).catch(() => {});
           if (error instanceof HttpError) throw error;
           throw new HttpError(500, "UPLOAD_FAILED", error instanceof Error ? error.message : "Upload failed.");
+        } finally {
+          if (!committed) releaseUploadBytes(reservedSize);
+          activeUploadDirectories.delete(id);
         }
       })();
       filePromise.catch((error) => {
@@ -346,6 +523,22 @@ async function saveUpload(req) {
     req.unpipe(busboy);
     req.off("aborted", abortUpload);
     req.off("error", requestError);
+  }
+}
+
+async function saveUpload(req) {
+  if (activeUploadCount >= uploadMaxConcurrent) {
+    throw new HttpError(
+      429,
+      "UPLOAD_CONCURRENCY_LIMIT",
+      `At most ${uploadMaxConcurrent} upload(s) may run concurrently; retry after one finishes.`,
+    );
+  }
+  activeUploadCount += 1;
+  try {
+    return await saveUploadWithinLimits(req);
+  } finally {
+    activeUploadCount -= 1;
   }
 }
 
@@ -1086,11 +1279,62 @@ function normalizeAppSessionState(raw) {
 }
 
 async function readAppSessionState() {
+  let raw;
   try {
-    return normalizeAppSessionState(JSON.parse(await readFile(appSessionStatePath, "utf8")));
-  } catch {
-    return normalizeAppSessionState(null);
+    raw = await readFile(appSessionStatePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return normalizeAppSessionState(null);
+    throw new HttpError(
+      500,
+      "SESSION_STATE_UNREADABLE",
+      `Cannot read ${appSessionStatePath}; restore its permissions or a known-good backup before retrying.`,
+    );
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new HttpError(
+      500,
+      "SESSION_STATE_CORRUPT",
+      `Cannot parse ${appSessionStatePath}; preserve it and restore a known-good backup before retrying.`,
+    );
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed.version !== undefined && parsed.version !== 1 && parsed.version !== 2) ||
+    (parsed.poolEntries !== undefined && !Array.isArray(parsed.poolEntries)) ||
+    (parsed.projectBindings !== undefined &&
+      (!parsed.projectBindings || typeof parsed.projectBindings !== "object" || Array.isArray(parsed.projectBindings))) ||
+    (Array.isArray(parsed.poolEntries) &&
+      parsed.poolEntries.some(
+        (entry) =>
+          !entry ||
+          typeof entry !== "object" ||
+          Array.isArray(entry) ||
+          typeof entry.key !== "string" ||
+          !entry.key.trim() ||
+          entry.key !== entry.key.trim() ||
+          (entry.displayName !== undefined &&
+            (typeof entry.displayName !== "string" || entry.displayName !== entry.displayName.trim() || entry.displayName.length > 80)) ||
+          (entry.createdAt !== undefined && typeof entry.createdAt !== "string"),
+      )) ||
+    (Array.isArray(parsed.poolEntries) &&
+      new Set(parsed.poolEntries.map((entry) => entry?.key)).size !== parsed.poolEntries.length) ||
+    (parsed.projectBindings &&
+      Object.entries(parsed.projectBindings).some(
+        ([sessionKey, projectPath]) => !sessionKey.trim() || typeof projectPath !== "string" || !projectPath,
+      ))
+  ) {
+    throw new HttpError(
+      500,
+      "SESSION_STATE_CORRUPT",
+      `${appSessionStatePath} has an invalid structure; preserve it and restore a known-good backup before retrying.`,
+    );
+  }
+  return normalizeAppSessionState(parsed);
 }
 
 async function writeAppSessionState(state) {
@@ -1318,9 +1562,9 @@ async function getRunState(url) {
   const tasksRaw = tasksResult.status === "fulfilled" && Array.isArray(tasksResult.value.tasks) ? tasksResult.value.tasks : [];
   const tasks = tasksRaw
     .map(normalizeTask)
+    .filter((task) => !task.sessionKey || task.sessionKey === sessionKey)
     .sort((a, b) => taskTimestamp(b) - taskTimestamp(a))
     .slice(0, 8);
-  const matchingTasks = tasks.filter((task) => !task.sessionKey || task.sessionKey === sessionKey);
   const approvals = approvalsResult.status === "fulfilled" ? approvalsResult.value : null;
 
   return {
@@ -1328,7 +1572,7 @@ async function getRunState(url) {
     sessionKey,
     session,
     source: sessionSource,
-    tasks: matchingTasks,
+    tasks,
     taskCount: tasksRaw.length,
     approvals: approvals
       ? {
@@ -1541,6 +1785,49 @@ async function resolveChatAttachments(rawAttachments) {
   );
 }
 
+const projectAuditActions = new Set(projectActions.map((action) => action.id));
+const projectAuditMetaKeys = new Set([
+  "action",
+  "projectPath",
+  "branch",
+  "sessionKey",
+  "agentId",
+  "command",
+  "messageLength",
+]);
+
+async function classifySendAudit(rawAudit, sessionKey, attachments) {
+  const audit = rawAudit && typeof rawAudit === "object" && !Array.isArray(rawAudit) ? rawAudit : null;
+  if (audit?.type !== "project_action") return { type: "chat_send", meta: {} };
+  const meta = audit.meta && typeof audit.meta === "object" && !Array.isArray(audit.meta) ? audit.meta : null;
+  const action = typeof meta?.action === "string" ? meta.action : "";
+  const projectPath = typeof meta?.projectPath === "string" ? meta.projectPath.trim() : "";
+  const branch = meta?.branch === undefined || typeof meta.branch === "string" ? meta?.branch || "" : null;
+  if (
+    !meta ||
+    !projectAuditActions.has(action) ||
+    !projectPath ||
+    branch === null ||
+    Object.keys(meta).some((key) => !projectAuditMetaKeys.has(key)) ||
+    attachments.length > 0
+  ) {
+    throw new HttpError(
+      400,
+      "INVALID_PROJECT_ACTION_AUDIT",
+      "Project action audit metadata must name an allowed action and project, and cannot include attachments or unknown fields.",
+    );
+  }
+  const state = await ensureAppSessionPool();
+  if (state.projectBindings[sessionKey] !== projectPath) {
+    throw new HttpError(
+      400,
+      "INVALID_PROJECT_ACTION_AUDIT",
+      "Project action audit metadata must match the project attached to this session.",
+    );
+  }
+  return { type: "project_action", meta: { ...meta, action, projectPath, branch } };
+}
+
 function attachmentPromptBlock(attachments) {
   if (!attachments.length) return "";
   const lines = [
@@ -1567,7 +1854,6 @@ async function sendMessage(req) {
   const sessionKey = typeof body.sessionKey === "string" ? body.sessionKey.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
   const attachments = await resolveChatAttachments(body.attachments);
-  const audit = body.audit && typeof body.audit === "object" && !Array.isArray(body.audit) ? body.audit : null;
   const idempotencyKey =
     typeof body.idempotencyKey === "string" && body.idempotencyKey.trim()
       ? body.idempotencyKey.trim()
@@ -1581,6 +1867,7 @@ async function sendMessage(req) {
   if (!message && attachments.length === 0) {
     return { ok: false, status: 400, code: "MESSAGE_REQUIRED", message: "message or attachment is required." };
   }
+  const audit = await classifySendAudit(body.audit, sessionKey, attachments);
   const outboundMessage = `${message || "Analizza gli allegati caricati."}${attachmentPromptBlock(attachments)}`;
   const result = await gatewayCall(
     "chat.send",
@@ -1593,8 +1880,8 @@ async function sendMessage(req) {
     { timeoutMs: 20000, processTimeoutMs: 25000 },
   );
   const command = message.startsWith("/") ? message.split(/\s+/)[0].slice(0, 80) : "";
-  await writeAuditEventQuiet(auditLogPath, audit?.type || "chat_send", {
-    ...(audit?.meta && typeof audit.meta === "object" ? audit.meta : {}),
+  await writeAuditEventQuiet(auditLogPath, audit.type, {
+    ...audit.meta,
     sessionKey,
     agentId: "main",
     command,

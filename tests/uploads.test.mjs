@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { request } from "node:http";
-import { cp, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,7 @@ async function startUploadServer(t, options = {}) {
   const root = new URL("../", import.meta.url);
   await cp(new URL("server.js", root), join(dir, "server.mjs"));
   await cp(new URL("lib/", root), join(dir, "lib"), { recursive: true });
+  await cp(new URL("public/", root), join(dir, "public"), { recursive: true });
   await writeFile(join(dir, "package.json"), '{"type":"module"}');
   await symlink(fileURLToPath(new URL("node_modules/", root)), join(dir, "node_modules"), "dir");
   // The wrapper reports the OS-assigned port without changing production startup.
@@ -46,6 +47,9 @@ async function startUploadServer(t, options = {}) {
       MOBILE_STUDIO_FILE_ROOT: dir,
       MOBILE_STUDIO_UPLOAD_DIR: join(dir, "uploads"),
       MOBILE_STUDIO_MAX_UPLOAD_BYTES: String(options.maxBytes || 64),
+      MOBILE_STUDIO_MAX_TOTAL_UPLOAD_BYTES: String(options.maxTotalBytes || 1024),
+      MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS: String(options.maxConcurrent || 2),
+      MOBILE_STUDIO_UPLOAD_TTL_MS: String(options.ttlMs || 60_000),
       MOBILE_STUDIO_TEST_UPLOAD_SETUP_DELAY_MS: String(options.setupDelayMs || 0),
       OPENCLAW_BIN: join(dir, "no-gateway"),
       OPENCLAW_SESSIONS_DIR: join(dir, "sessions"),
@@ -57,6 +61,7 @@ async function startUploadServer(t, options = {}) {
   const [address] = await once(child, "message", { signal: AbortSignal.timeout(5000) });
   return {
     dir,
+    baseUrl: `http://127.0.0.1:${address.port}`,
     url: `http://127.0.0.1:${address.port}/api/uploads`,
     assertAlive() { assert.equal(child.exitCode, null, `upload crashed the server: ${errors}`); },
   };
@@ -181,6 +186,139 @@ test("upload maximum is inclusive at max-1, max, and max+1 bytes", async (t) => 
   const over = await upload(server, "over.bin", "x".repeat(65));
   assert.equal(over.status, 413);
   assert.equal((await over.json()).error.code, "UPLOAD_TOO_LARGE");
+  server.assertAlive();
+});
+
+test("expired attachment manifests are rejected on send and removed", async (t) => {
+  const server = await startUploadServer(t, { ttlMs: 20 });
+  const uploadResponse = await upload(server, "short-lived.txt", "abc");
+  assert.equal(uploadResponse.status, 200);
+  const { attachment } = await uploadResponse.json();
+  await setTimeout(Math.max(0, Date.parse(attachment.expiresAt) - Date.now()) + 20);
+
+  const response = await fetch(`${server.baseUrl}/api/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionKey: "agent:main:mobile-studio:session:pool-1",
+      message: "read attachment",
+      attachments: [{ id: attachment.id }],
+    }),
+  });
+  assert.equal(response.status, 410);
+  assert.equal((await response.json()).error.code, "ATTACHMENT_EXPIRED");
+  assert.deepEqual(await readdir(join(server.dir, "uploads")), []);
+  server.assertAlive();
+});
+
+test("upload maintenance removes expired, malformed, partial, and orphaned directories without leaving the root", async (t) => {
+  const server = await startUploadServer(t);
+  const uploadRoot = join(server.dir, "uploads");
+  const outsideRoot = join(server.dir, "outside-sentinel");
+  await mkdir(uploadRoot, { recursive: true });
+  await mkdir(outsideRoot);
+  await writeFile(join(outsideRoot, "keep.txt"), "keep");
+
+  const malformedId = "11111111-1111-4111-8111-111111111111";
+  await mkdir(join(uploadRoot, malformedId));
+  await writeFile(join(uploadRoot, malformedId, "manifest.json"), "{broken");
+
+  await mkdir(join(uploadRoot, "orphan-directory"));
+  await writeFile(join(uploadRoot, "orphan-directory", "file-partial.txt"), "partial");
+
+  const missingId = "22222222-2222-4222-8222-222222222222";
+  await mkdir(join(uploadRoot, missingId));
+  await writeFile(
+    join(uploadRoot, missingId, "manifest.json"),
+    JSON.stringify({
+      id: missingId,
+      name: "missing.txt",
+      size: 7,
+      path: join(uploadRoot, missingId, "file-missing.txt"),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }),
+  );
+
+  const expiredId = "33333333-3333-4333-8333-333333333333";
+  const expiredDir = join(uploadRoot, expiredId);
+  await mkdir(expiredDir);
+  await writeFile(join(expiredDir, "file-expired.txt"), "old");
+  await writeFile(
+    join(expiredDir, "manifest.json"),
+    JSON.stringify({
+      id: expiredId,
+      name: "expired.txt",
+      size: 3,
+      path: join(expiredDir, "file-expired.txt"),
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    }),
+  );
+
+  const poisonedId = "44444444-4444-4444-8444-444444444444";
+  await mkdir(join(uploadRoot, poisonedId));
+  await writeFile(
+    join(uploadRoot, poisonedId, "manifest.json"),
+    JSON.stringify({
+      id: poisonedId,
+      name: "outside.txt",
+      size: 4,
+      path: join(outsideRoot, "keep.txt"),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }),
+  );
+  await symlink(outsideRoot, join(uploadRoot, "outside-link"), "dir");
+
+  const response = await upload(server, "fresh.txt", "fresh");
+  assert.equal(response.status, 200);
+  const { attachment } = await response.json();
+  assert.deepEqual((await readdir(uploadRoot)).sort(), [attachment.id, "outside-link"].sort());
+  assert.equal(await readFile(join(outsideRoot, "keep.txt"), "utf8"), "keep");
+  server.assertAlive();
+});
+
+test("aggregate upload capacity is enforced across completed uploads", async (t) => {
+  const server = await startUploadServer(t, { maxTotalBytes: 8 });
+  assert.equal((await upload(server, "first.txt", "12345")).status, 200);
+  const rejected = await upload(server, "second.txt", "6789");
+  assert.equal(rejected.status, 507);
+  assert.equal((await rejected.json()).error.code, "UPLOAD_CAPACITY_EXCEEDED");
+  assert.equal((await readdir(join(server.dir, "uploads"))).length, 1);
+  assert.equal((await upload(server, "fits.txt", "678")).status, 200);
+  assert.equal((await readdir(join(server.dir, "uploads"))).length, 2);
+  server.assertAlive();
+});
+
+test("aggregate capacity reservations prevent concurrent uploads from oversubscribing storage", async (t) => {
+  const server = await startUploadServer(t, { maxTotalBytes: 8, maxConcurrent: 2 });
+  const responses = await Promise.all([
+    upload(server, "left.txt", "12345"),
+    upload(server, "right.txt", "67890"),
+  ]);
+  assert.deepEqual(responses.map((response) => response.status).sort((a, b) => a - b), [200, 507]);
+  const rejected = responses.find((response) => response.status === 507);
+  assert.equal((await rejected.json()).error.code, "UPLOAD_CAPACITY_EXCEEDED");
+  assert.equal((await readdir(join(server.dir, "uploads"))).length, 1);
+  server.assertAlive();
+});
+
+test("concurrent upload limit rejects excess work and releases its slot after abort", async (t) => {
+  const server = await startUploadServer(t, { maxConcurrent: 1 });
+  const held = request(server.url, {
+    method: "POST",
+    headers: { "content-type": "multipart/form-data; boundary=fixture" },
+  });
+  held.on("error", () => {});
+  t.after(() => held.destroy());
+  held.write('--fixture\r\nContent-Disposition: form-data; name="file"; filename="held.txt"\r\n\r\nheld');
+  const uploads = () => readdir(join(server.dir, "uploads")).catch(() => []);
+  await waitUntil(async () => (await uploads()).length === 1);
+
+  const rejected = await upload(server, "second.txt", "second");
+  assert.equal(rejected.status, 429);
+  assert.equal((await rejected.json()).error.code, "UPLOAD_CONCURRENCY_LIMIT");
+  held.destroy();
+  await waitUntil(async () => (await uploads()).length === 0);
+  assert.equal((await upload(server, "after.txt", "after")).status, 200);
   server.assertAlive();
 });
 

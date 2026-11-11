@@ -68,6 +68,8 @@ OPENCLAW_BIN=/path/to/openclaw
 MOBILE_STUDIO_SESSION_POOL_SIZE=5
 MOBILE_STUDIO_UPLOAD_DIR=./data/chat-uploads
 MOBILE_STUDIO_MAX_UPLOAD_BYTES=1073741824
+MOBILE_STUDIO_MAX_TOTAL_UPLOAD_BYTES=2147483648
+MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS=2
 MOBILE_STUDIO_UPLOAD_TTL_MS=604800000
 MOBILE_STUDIO_MAX_ATTACHMENTS_PER_MESSAGE=5
 ```
@@ -96,11 +98,17 @@ Project `Chat` does not create sessions and does not use the currently selected 
 
 Project bindings are stored server-side in `data/session-state.json`. On migration from the v1 state shape, bound Mobile Studio keys seed the new registry before empty deterministic slots are added. Unbound legacy Gateway sessions are not adopted or deleted. If the configured size is reduced, excess registry entries and bindings stay preserved in app state but are hidden; increasing it makes preserved entries active again. The browser cache is only a startup accelerator.
 
+Existing session state is fail-closed. A missing file is initialized normally, but invalid JSON, an invalid state shape, or an unreadable existing file returns `SESSION_STATE_CORRUPT` or `SESSION_STATE_UNREADABLE` and is never replaced. Before upgrades or manual state maintenance, stop this service and copy `data/session-state.json` to protected storage. To recover, preserve the rejected file for diagnosis, then restore a known-good copy with the service account as owner and restrictive permissions. If no backup exists, an operator may deliberately move the preserved bad file aside while the service is stopped; the next request creates a new pool registry, and prior project bindings must then be reattached. Gateway transcripts are separate and are not part of this file.
+
 ## Chat Attachments
 
-The composer can upload files before sending a message. Uploads are streamed to `MOBILE_STUDIO_UPLOAD_DIR`, defaulting to `data/chat-uploads/`, and the message sent to OpenClaw includes filesystem-readable paths plus metadata. Defaults are 1 GB per file, 5 attachments per message, and 7 days before cleanup. The byte maximum is inclusive: exactly `MOBILE_STUDIO_MAX_UPLOAD_BYTES` is accepted and one byte more is rejected.
+The composer can upload files before sending a message. Uploads are streamed to `MOBILE_STUDIO_UPLOAD_DIR`, defaulting to `data/chat-uploads/`, and the message sent to OpenClaw includes filesystem-readable paths plus metadata. Defaults are 1 GB per file, 2 GB across completed and in-progress payloads, 2 concurrent upload requests, 5 attachments per message, and a 7-day TTL. `MOBILE_STUDIO_MAX_TOTAL_UPLOAD_BYTES` and `MOBILE_STUDIO_MAX_CONCURRENT_UPLOADS` control the aggregate and concurrency budgets. Both byte maxima are inclusive.
+
+Expired manifests are rejected during send and removed. Before accepting a new upload, the service removes expired, malformed, partial, and orphaned real directories directly beneath the configured upload root. Manifest payloads must be ordinary files directly inside their own upload directory; cleanup does not follow symlinks or manifest paths outside the root. Capacity and concurrency accounting are race-safe for the supported single server process. Multiple processes must not share one upload root.
 
 Pending attachment queues are separate per session. Switching sessions neither displays nor clears another session's queue, and upload/send completion is attributed to the session where it began. Project actions never carry composer attachments implicitly and do not clear them.
+
+`/api/send` owns audit event semantics. Ordinary sends, including requests claiming `git_action`, `branch_switch`, or another client-selected type, are recorded as `chat_send`. `project_action` is accepted only for a UI-supported action with allowed metadata, no attachments, and a project path that matches the selected session's server-side binding. Server-calculated session, agent, command, length, and attachment fields override client metadata.
 
 ## Tailscale Serve Example
 
@@ -157,7 +165,7 @@ See [v0.1 stabilization notes](docs/STABILIZATION-v0.1.md) for the local proof a
 - Mobile-originated chat sends use `deliver:false` so they do not automatically post to external channels.
 - Project action buttons and risky slash commands require a deliberate second tap/click.
 - Git write actions are guarded and do not force-push, rebase, stash, or resolve conflicts.
-- Audit logs are local, append-only JSONL, rotate at 1 MB, and store metadata only.
+- Audit logs are local, append-only JSONL, rotate at 1 MB, store metadata only, and use server-selected send event types.
 
 ## License
 
