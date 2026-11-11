@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-async function preparePoolServer(t, gatewaySessions = []) {
+async function preparePoolServer(t, gatewaySessions = [], gatewayResponses = {}) {
   const dir = await mkdtemp(join(tmpdir(), "oms-pool-test-"));
   const children = new Set();
   t.after(async () => {
@@ -28,7 +28,17 @@ async function preparePoolServer(t, gatewaySessions = []) {
   await symlink(fileURLToPath(new URL("node_modules/", root)), join(dir, "node_modules"), "dir");
   await writeFile(
     join(dir, "fake-openclaw.mjs"),
-    `#!/usr/bin/env node\nconsole.log(JSON.stringify({ sessions: ${JSON.stringify(gatewaySessions)}, defaults: null }));\n`,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const method = args[2] || "";
+const paramsIndex = args.indexOf("--params");
+const params = paramsIndex >= 0 ? JSON.parse(args[paramsIndex + 1]) : {};
+appendFileSync(${JSON.stringify(join(dir, "gateway-calls.jsonl"))}, JSON.stringify({ method, params }) + "\\n");
+const responses = ${JSON.stringify(gatewayResponses)};
+const response = responses[method] ?? (method === "sessions.list" ? { sessions: ${JSON.stringify(gatewaySessions)}, defaults: null } : {});
+console.log(JSON.stringify(response));
+`,
     { mode: 0o755 },
   );
   await writeFile(
@@ -80,7 +90,17 @@ async function preparePoolServer(t, gatewaySessions = []) {
     };
   }
 
-  return { dir, start };
+  return {
+    dir,
+    start,
+    async gatewayCalls() {
+      const raw = await readFile(join(dir, "gateway-calls.jsonl"), "utf8").catch((error) => {
+        if (error.code === "ENOENT") return "";
+        throw error;
+      });
+      return raw.trim() ? raw.trim().split("\n").map((line) => JSON.parse(line)) : [];
+    },
+  };
 }
 
 test("two concurrent first lists create one stable configured pool across restart", async (t) => {
@@ -149,4 +169,162 @@ test("v1 project bindings seed migration without deleting the binding", async (t
   const payload = await fetch(`${server.url}/api/sessions`).then((response) => response.json());
   assert.equal(payload.sessions[0].key, legacyKey);
   assert.equal(payload.sessions[0].projectPath, "projects/kept");
+});
+
+test("v1 migration preserves every binding through pool shrink and later growth", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const legacyBindings = Object.fromEntries(
+    Array.from({ length: 4 }, (_, index) => [
+      `agent:main:mobile-studio:session:legacy-${index + 1}`,
+      `projects/legacy-${index + 1}`,
+    ]),
+  );
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(
+    join(fixture.dir, "data", "session-state.json"),
+    `${JSON.stringify({ version: 1, projectBindings: legacyBindings })}\n`,
+  );
+
+  const shrunk = await fixture.start(2);
+  const shrunkPayload = await fetch(`${shrunk.url}/api/sessions`).then((response) => response.json());
+  assert.deepEqual(shrunkPayload.sessions.map((session) => session.key), Object.keys(legacyBindings).slice(0, 2));
+  const migrated = JSON.parse(await readFile(join(fixture.dir, "data", "session-state.json"), "utf8"));
+  assert.deepEqual(migrated.poolEntries.map((entry) => entry.key), Object.keys(legacyBindings));
+  await shrunk.stop();
+
+  const grown = await fixture.start(4);
+  const grownPayload = await fetch(`${grown.url}/api/sessions`).then((response) => response.json());
+  assert.deepEqual(grownPayload.sessions.map((session) => session.key), Object.keys(legacyBindings));
+  assert.deepEqual(grownPayload.sessions.map((session) => session.projectPath), Object.values(legacyBindings));
+});
+
+test("abort rejects external session keys before calling Gateway", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const server = await fixture.start(2);
+  const response = await fetch(`${server.url}/api/abort`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionKey: "agent:main:unrelated", agentId: "external" }),
+  });
+
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error.code, "SESSION_NOT_FOUND");
+  assert.deepEqual(await fixture.gatewayCalls(), []);
+});
+
+test("abort forwards only the authorized pool key and run id", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const fixture = await preparePoolServer(t);
+  const server = await fixture.start(1);
+  const response = await fetch(`${server.url}/api/abort`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionKey: poolKey,
+      sessionId: "attacker-selected-session",
+      agentId: "attacker-selected-agent",
+      runId: "authorized-run",
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await fixture.gatewayCalls(), [
+    {
+      method: "chat.abort",
+      params: { sessionKey: poolKey, runId: "authorized-run" },
+    },
+  ]);
+});
+
+test("attention and run-state never expose external task session keys", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const externalKey = "agent:main:unrelated";
+  const fixture = await preparePoolServer(
+    t,
+    [{ key: poolKey, sessionId: "pool-session", agentId: "main" }],
+    {
+      "tasks.list": {
+        tasks: [
+          { id: "pool-task", status: "running", sessionKey: poolKey },
+          { id: "external-task", status: "waiting", sessionKey: externalKey },
+        ],
+      },
+    },
+  );
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(
+    join(fixture.dir, "data", "audit-log.jsonl"),
+    `${JSON.stringify({
+      id: "external-session-project-action",
+      ts: new Date().toISOString(),
+      type: "project_action",
+      meta: {
+        sessionKey: externalKey,
+        action: "review_changes",
+        projectPath: "projects/example",
+      },
+    })}\n`,
+  );
+  const server = await fixture.start(2);
+
+  const attention = await fetch(`${server.url}/api/attention?details=1`).then((response) => response.json());
+  assert.equal(attention.items.some((item) => item.id === "task:pool-task" && item.sessionKey === poolKey), true);
+  assert.equal(attention.items.some((item) => item.id === "task:external-task" || item.sessionKey === externalKey), false);
+  assert.equal(attention.recentTasks.some((task) => task.id === "external-task" || task.sessionKey === externalKey), false);
+  assert.equal(attention.summary.activeTasks, 1);
+  assert.deepEqual(attention.auditEvents[0].meta, {
+    action: "review_changes",
+    projectPath: "projects/example",
+  });
+
+  const runState = await fetch(
+    `${server.url}/api/run-state?details=1&sessionKey=${encodeURIComponent(poolKey)}`,
+  ).then((response) => response.json());
+  assert.deepEqual(runState.tasks.map((task) => task.id), ["pool-task"]);
+  assert.equal(JSON.stringify({ attention, runState }).includes(externalKey), false);
+});
+
+test("send ignores caller backing IDs and protects calculated audit metadata", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const fixture = await preparePoolServer(t);
+  const server = await fixture.start(1);
+  const response = await fetch(`${server.url}/api/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      sessionKey: poolKey,
+      sessionId: "attacker-selected-session",
+      agentId: "attacker-selected-agent",
+      message: "hello",
+      idempotencyKey: "test-send",
+      audit: {
+        type: "project_action",
+        meta: {
+          action: "review_changes",
+          projectPath: "projects/example",
+          sessionKey: "agent:main:unrelated",
+          agentId: "forged-agent",
+          command: "/forged",
+          messageLength: 9999,
+        },
+      },
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  const sendCall = (await fixture.gatewayCalls()).find((call) => call.method === "chat.send");
+  assert.deepEqual(sendCall.params, {
+    sessionKey: poolKey,
+    message: "hello",
+    deliver: false,
+    idempotencyKey: "test-send",
+  });
+  const [event] = await fetch(`${server.url}/api/audit?limit=1`).then((auditResponse) => auditResponse.json()).then((body) => body.events);
+  assert.deepEqual(event.meta, {
+    sessionKey: poolKey,
+    agentId: "main",
+    messageLength: 5,
+    action: "review_changes",
+    projectPath: "projects/example",
+  });
 });

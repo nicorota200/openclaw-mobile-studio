@@ -1125,13 +1125,10 @@ function completePoolEntries(state) {
   }));
   const knownKeys = new Set(poolEntries.map((entry) => entry.key));
 
-  if (poolEntries.length === 0) {
-    for (const key of Object.keys(state.projectBindings)) {
-      if (!key.startsWith("agent:main:mobile-studio:session:") || knownKeys.has(key)) continue;
-      poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
-      knownKeys.add(key);
-      if (poolEntries.length >= sessionPoolSize) break;
-    }
+  for (const key of Object.keys(state.projectBindings)) {
+    if (!key.startsWith("agent:main:mobile-studio:session:") || knownKeys.has(key)) continue;
+    poolEntries.push({ key, displayName: mobileStudioSessionName(poolEntries.length + 1), createdAt: now });
+    knownKeys.add(key);
   }
 
   for (let index = 1; poolEntries.length < sessionPoolSize; index += 1) {
@@ -1331,7 +1328,7 @@ async function getRunState(url) {
     sessionKey,
     session,
     source: sessionSource,
-    tasks: matchingTasks.length > 0 ? matchingTasks : tasks,
+    tasks: matchingTasks,
     taskCount: tasksRaw.length,
     approvals: approvals
       ? {
@@ -1388,12 +1385,20 @@ async function getAttention(url = new URL("http://local/api/attention")) {
   ]);
 
   const sessions = sessionsResult.status === "fulfilled" ? sessionsResult.value.sessions || [] : [];
+  const activePoolKeys = new Set(sessions.map((session) => session.key));
   const projects = projectsResult.status === "fulfilled" ? projectsResult.value.projects || [] : [];
   const rawTasks = tasksResult.status === "fulfilled" && Array.isArray(tasksResult.value.tasks) ? tasksResult.value.tasks : [];
-  const tasks = rawTasks.map(normalizeTask).sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
+  const tasks = rawTasks
+    .map(normalizeTask)
+    .filter((task) => !task.sessionKey || activePoolKeys.has(task.sessionKey))
+    .sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
   const approvals = approvalsResult.status === "fulfilled" ? approvalsResult.value : null;
   const health = healthResult.status === "fulfilled" ? healthResult.value : null;
-  const auditEvents = await readAuditEvents(auditLogPath, 8).catch(() => []);
+  const auditEvents = (await readAuditEvents(auditLogPath, 8).catch(() => [])).map((event) => {
+    if (!event?.meta?.sessionKey || activePoolKeys.has(event.meta.sessionKey)) return event;
+    const { sessionKey: _externalSessionKey, ...meta } = event.meta;
+    return { ...event, meta };
+  });
 
   const items = [];
   for (const session of sessions.filter(isAttentionActiveSession).slice(0, 5)) {
@@ -1560,8 +1565,6 @@ function attachmentPromptBlock(attachments) {
 async function sendMessage(req) {
   const body = await readJson(req);
   const sessionKey = typeof body.sessionKey === "string" ? body.sessionKey.trim() : "";
-  const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
-  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
   const attachments = await resolveChatAttachments(body.attachments);
   const audit = body.audit && typeof body.audit === "object" && !Array.isArray(body.audit) ? body.audit : null;
@@ -1583,8 +1586,6 @@ async function sendMessage(req) {
     "chat.send",
     {
       sessionKey,
-      ...(sessionId ? { sessionId } : {}),
-      ...(agentId ? { agentId } : {}),
       message: outboundMessage,
       deliver: false,
       idempotencyKey,
@@ -1593,13 +1594,13 @@ async function sendMessage(req) {
   );
   const command = message.startsWith("/") ? message.split(/\s+/)[0].slice(0, 80) : "";
   await writeAuditEventQuiet(auditLogPath, audit?.type || "chat_send", {
+    ...(audit?.meta && typeof audit.meta === "object" ? audit.meta : {}),
     sessionKey,
-    agentId,
+    agentId: "main",
     command,
     messageLength: outboundMessage.length,
     attachmentCount: attachments.length,
     attachmentBytes: attachments.reduce((total, attachment) => total + (Number(attachment.size) || 0), 0),
-    ...(audit?.meta && typeof audit.meta === "object" ? audit.meta : {}),
   });
   return {
     ok: true,
@@ -1612,20 +1613,21 @@ async function abortRun(req) {
   const body = await readJson(req);
   const sessionKey = typeof body.sessionKey === "string" ? body.sessionKey.trim() : "";
   const runId = typeof body.runId === "string" ? body.runId.trim() : "";
-  const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
   if (!sessionKey) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
+  }
+  if (!(await isActivePoolSession(sessionKey))) {
+    return { ok: false, status: 404, code: "SESSION_NOT_FOUND", message: "Pool session not found." };
   }
   const result = await gatewayCall(
     "chat.abort",
     {
       sessionKey,
       ...(runId ? { runId } : {}),
-      ...(agentId ? { agentId } : {}),
     },
     { timeoutMs: 10000 },
   );
-  await writeAuditEventQuiet(auditLogPath, "run_abort", { sessionKey, runId, agentId });
+  await writeAuditEventQuiet(auditLogPath, "run_abort", { sessionKey, runId, agentId: "main" });
   return { ok: true, result };
 }
 

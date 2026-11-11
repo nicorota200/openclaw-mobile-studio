@@ -2813,7 +2813,6 @@ function attachmentSummaryText(attachments) {
 async function sendMessage(message, options = {}) {
   const command = message.trim().split(/\s+/)[0]?.toLowerCase() || "";
   const sessionKey = state.selectedSessionKey;
-  const session = sessionByKey(sessionKey);
   const includeAttachments = options.includeAttachments !== false;
   const attachmentItems = attachmentItemsForSend(state, sessionKey, includeAttachments);
   const attachments = attachmentItems.map((item) => item.attachment);
@@ -2841,8 +2840,6 @@ async function sendMessage(message, options = {}) {
       method: "POST",
       body: JSON.stringify({
         sessionKey,
-        sessionId: session?.sessionId || undefined,
-        agentId: session?.agentId || undefined,
         message,
         attachments: attachments.map((attachment) => ({ id: attachment.id })),
         idempotencyKey,
@@ -2915,8 +2912,6 @@ async function abortSelectedRun() {
     method: "POST",
     body: JSON.stringify({
       sessionKey: state.selectedSessionKey,
-      sessionId: state.selectedSession?.sessionId || undefined,
-      agentId: state.selectedSession?.agentId || undefined,
     }),
   });
   setStatus("Stop requested", "ok");
