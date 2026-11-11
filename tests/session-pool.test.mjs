@@ -305,6 +305,29 @@ test("v1 migration preserves every binding through pool shrink and later growth"
   assert.deepEqual(grownPayload.sessions.map((session) => session.projectPath), Object.values(legacyBindings));
 });
 
+test("history ignores a forged agent id and retrieves the authorized pool session", async (t) => {
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const messages = [{ role: "assistant", content: [{ type: "text", text: "authorized history" }] }];
+  const fixture = await preparePoolServer(t, [], {
+    "chat.history": { sessionKey: poolKey, sessionId: "pool-session", messages },
+  });
+  const server = await fixture.start(1);
+  const response = await fetch(
+    `${server.url}/api/history?sessionKey=${encodeURIComponent(poolKey)}&agentId=attacker-selected-agent&limit=17`,
+  );
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(payload.messages, messages);
+  assert.deepEqual(await fixture.gatewayCalls(), [
+    {
+      method: "chat.history",
+      params: { sessionKey: poolKey, limit: 17, maxChars: 4000 },
+    },
+  ]);
+  server.assertAlive();
+});
+
 test("abort rejects external session keys before calling Gateway", async (t) => {
   const fixture = await preparePoolServer(t);
   const server = await fixture.start(2);

@@ -1536,7 +1536,6 @@ async function listSessions() {
 
 async function getHistory(url) {
   const sessionKey = url.searchParams.get("sessionKey") || "";
-  const agentId = url.searchParams.get("agentId") || "";
   const limit = Math.min(Number.parseInt(url.searchParams.get("limit") || String(defaultLimit), 10), 200);
   if (!sessionKey.trim()) {
     return { ok: false, status: 400, code: "SESSION_KEY_REQUIRED", message: "sessionKey is required." };
@@ -1548,7 +1547,6 @@ async function getHistory(url) {
     sessionKey,
     limit,
     maxChars,
-    ...(agentId ? { agentId } : {}),
   };
   const result = await gatewayCall("chat.history", params, { timeoutMs: 15000 });
   return {
