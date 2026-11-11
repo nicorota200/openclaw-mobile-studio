@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import Busboy from "busboy";
 import { readAuditEvents, writeAuditEventQuiet } from "./lib/audit.js";
 import { loadServerConfig } from "./lib/config.js";
+import { mobileStudioVersion } from "./lib/version.js";
 import { projectActions } from "./public/project-actions.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -673,7 +674,7 @@ async function getHealth() {
   return {
     ok: healthResult.status === "fulfilled" && statusResult.status === "fulfilled",
     mobileStudio: {
-      version: "0.1.0",
+      version: mobileStudioVersion,
       auth: authToken ? "token" : "disabled-loopback-only",
       host,
       port,

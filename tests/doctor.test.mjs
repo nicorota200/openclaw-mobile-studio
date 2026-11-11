@@ -16,7 +16,7 @@ async function doctorFixture(t) {
     PATH: "/test/bin",
     MOBILE_STUDIO_FILE_ROOT: root,
     OPENCLAW_BIN: openclaw,
-    MOBILE_STUDIO_TOKEN: "must-not-appear-in-doctor-output",
+    MOBILE_STUDIO_TOKEN: "",
   };
   return { dir, root, openclaw, env };
 }
@@ -39,7 +39,7 @@ function successfulRun(openclaw, { openclawVersion = "OpenClaw 2026.9.4 (test)",
   };
 }
 
-test("doctor passes compatible prerequisites and never emits configured secrets", async (t) => {
+test("doctor passes compatible trusted-tailnet prerequisites", async (t) => {
   const fixture = await doctorFixture(t);
   const report = await runDoctor({
     env: fixture.env,
@@ -52,8 +52,24 @@ test("doctor passes compatible prerequisites and never emits configured secrets"
   assert.equal(report.summary.failures, 0);
   assert(report.results.some((item) => item.id === "gateway" && item.status === "pass"));
   assert(report.results.some((item) => item.id === "tailscale-serve" && item.status === "pass"));
-  assert.doesNotMatch(JSON.stringify(report), /must-not-appear-in-doctor-output/);
+  assert(report.results.some((item) => item.id === "pwa-auth" && item.status === "pass"));
   assert.match(renderDoctorReport(report), /Doctor passed/);
+});
+
+test("doctor rejects a bearer token unsupported by the standard PWA without exposing it", async (t) => {
+  const fixture = await doctorFixture(t);
+  fixture.env.MOBILE_STUDIO_TOKEN = "must-not-appear-in-doctor-output";
+  const report = await runDoctor({
+    env: fixture.env,
+    cwd: fixture.dir,
+    platform: "linux",
+    nodeVersion: "v24.18.0",
+    run: successfulRun(fixture.openclaw),
+  });
+  assert.equal(report.ok, false);
+  assert(report.results.some((item) => item.id === "pwa-auth" && item.status === "fail"));
+  assert.doesNotMatch(JSON.stringify(report), /must-not-appear-in-doctor-output/);
+  assert.match(renderDoctorReport(report), /Leave MOBILE_STUDIO_TOKEN empty/);
 });
 
 test("doctor fails unsupported OpenClaw and keeps missing Serve routing as a warning", async (t) => {

@@ -1,6 +1,6 @@
 # Independent installation trial
 
-Use this protocol for each Phase 4 installation. A trial counts only when it runs on a distinct compatible Linux host with its own OpenClaw Gateway and Tailscale node. Two directories, users, containers, or virtual machines backed by the same physical server do not satisfy the two-host release gate.
+Use this protocol for each Phase 4 installation. A trial counts only when it runs on a distinct compatible Linux OS instance with its own user, filesystem, systemd manager, OpenClaw Gateway, and Tailscale node. Two directories, users, or ordinary containers inside the same OS do not satisfy the two-host release gate. Separately provisioned virtual machines may count even on one physical hypervisor when they do not share application configuration or data and were not validated from an already-configured Mobile Studio image.
 
 The operator must follow `docs/OPERATIONS.md` without editing application source. Start a timer before cloning and stop it after the final doctor, local health probe, and private browser check pass. The target is approximately 30 minutes without maintainer intervention.
 

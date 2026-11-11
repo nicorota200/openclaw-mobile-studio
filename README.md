@@ -108,13 +108,9 @@ npm run doctor -- --env-file "$HOME/.config/openclaw-mobile-studio/env"
 
 Use `npm run --silent doctor -- --env-file PATH --json` for machine-readable results without npm's command banner. Doctor checks supported versions, safe configuration, data permissions, read-only Gateway probes, Tailscale connectivity/Serve state, and the user systemd manager. It never prints the configured Mobile Studio token.
 
-`MOBILE_STUDIO_TOKEN` is optional. If set, API requests must use:
+`MOBILE_STUDIO_TOKEN` must remain empty for the supported PWA deployment. The server retains bearer-token handling only for API compatibility, but the standard browser client does not collect, store, or submit bearer credentials. `npm run doctor` therefore fails when the variable is set.
 
-```text
-Authorization: Bearer <token>
-```
-
-The service is intended to bind to loopback and sit behind a trusted private reverse proxy or VPN route.
+The service binds to loopback and relies on the private trusted-tailnet route as its supported access boundary. A future application-login design is required before shared-tailnet or public access.
 
 `MOBILE_STUDIO_GIT_MODE` accepts exactly `read` or `write` and defaults to `read` when unset. In `read` mode, Git inspection remains available while the server rejects every direct Git mutation route with `403 GIT_WRITES_DISABLED`. Set it to `write` and restart the service to expose the existing guarded branch switch, pull, stage, unstage, commit, and push actions. This is a server configuration, not an in-app toggle.
 
@@ -127,13 +123,13 @@ The initial supported access boundary is a **single-user private Tailscale tailn
 - Do not enable Tailscale Funnel or otherwise publish the route to the internet.
 - Treat every principal able to reach the Mobile Studio route as the authorized owner of all enabled capabilities.
 
-There is no application-level user identity or login in this phase. `MOBILE_STUDIO_TOKEN` remains an optional compatibility control, not a substitute for a correctly restricted tailnet. Shared tailnets, multiple users, and public exposure are outside the supported product contract.
+There is no application-level user identity or login in this phase. Server bearer-token handling is not a substitute for a correctly restricted tailnet and is not supported by the standard PWA. Shared tailnets, multiple users, and public exposure are outside the supported product contract.
 
 ## Sessions And Project Chats
 
 Mobile Studio provisions its fixed pool on the first session-list request. `MOBILE_STUDIO_SESSION_POOL_SIZE` defaults to 5 and must be an integer from 1 through 20. Pool keys and names are stored in the app-owned `data/session-state.json` and remain stable across restart. Empty slots appear immediately, even before the Gateway has a corresponding session. The first explicit user message lazily materializes that exact key through the supported Gateway `chat.send` path with `deliver:false`.
 
-Settings intentionally has no create or delete controls in v0.1. `Open` selects a pool slot and `Detach` clears its project binding without changing Gateway history. POST and DELETE `/api/sessions` return `405 SESSION_POOL_FIXED`.
+Settings intentionally has no create or delete controls in this release. `Open` selects a pool slot and `Detach` clears its project binding without changing Gateway history. POST and DELETE `/api/sessions` return `405 SESSION_POOL_FIXED`.
 
 Mobile Studio does not write, replace, delete, or move the Gateway-owned session index or transcripts. Session metadata is read through `sessions.list`; a Gateway row is merged only when its key exactly matches an app-owned pool key. Existing Gateway sessions and history are otherwise left untouched.
 
@@ -207,7 +203,12 @@ CHROMIUM_PATH=/path/to/chromium npm run visual:smoke
 
 Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; isolated server tests cover backend behavior.
 
-See [v0.1 stabilization notes](docs/STABILIZATION-v0.1.md) for the local proof and remaining review concerns.
+Release preparation references:
+
+- [Changelog](CHANGELOG.md)
+- [v0.2.0-rc.1 release notes](docs/RELEASE-NOTES-v0.2.0-rc.1.md)
+- [Independent installation trial](docs/INSTALLATION-TRIAL.md)
+- [v0.1 stabilization notes](docs/STABILIZATION-v0.1.md)
 
 ## Security Notes
 

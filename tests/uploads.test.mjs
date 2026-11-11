@@ -23,9 +23,9 @@ async function startUploadServer(t, options = {}) {
   });
   const root = new URL("../", import.meta.url);
   await cp(new URL("server.js", root), join(dir, "server.mjs"));
+  await cp(new URL("package.json", root), join(dir, "package.json"));
   await cp(new URL("lib/", root), join(dir, "lib"), { recursive: true });
   await cp(new URL("public/", root), join(dir, "public"), { recursive: true });
-  await writeFile(join(dir, "package.json"), '{"type":"module"}');
   await symlink(fileURLToPath(new URL("node_modules/", root)), join(dir, "node_modules"), "dir");
   // The wrapper reports the OS-assigned port without changing production startup.
   await writeFile(join(dir, "start.mjs"), `

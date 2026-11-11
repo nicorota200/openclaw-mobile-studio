@@ -16,6 +16,7 @@ test("systemd and environment templates use the documented portable layout", asy
   assert.match(unit, /EnvironmentFile=%h\/\.config\/openclaw-mobile-studio\/env/);
   assert.match(unit, /ExecStart=\/usr\/bin\/env npm run start/);
   assert.equal(parsed.HOST, "127.0.0.1");
+  assert.equal(parsed.MOBILE_STUDIO_TOKEN, "");
   assert.equal(parsed.MOBILE_STUDIO_GIT_MODE, "read");
   assert.equal(parsed.MOBILE_STUDIO_BASE_PATH, "/mobile-studio");
   assert.match(parsed.OPENCLAW_BIN, /^\/absolute\/path/);
@@ -41,11 +42,23 @@ test("operations guide covers every Phase 3 lifecycle requirement", async () => 
 
 test("independent installation protocol preserves the Phase 4 release gate", async () => {
   const protocol = await readFile(new URL("docs/INSTALLATION-TRIAL.md", root), "utf8");
-  assert.match(protocol, /distinct compatible Linux host/);
+  assert.match(protocol, /distinct compatible Linux OS instance/);
   assert.match(protocol, /do not satisfy the two-host release gate/);
+  assert.match(protocol, /Separately provisioned virtual machines may count/);
   assert.match(protocol, /without editing application source/);
   assert.match(protocol, /approximately 30 minutes/);
   assert.match(protocol, /MOBILE_STUDIO_GIT_MODE=read/);
   assert.match(protocol, /release candidate may be tagged only after two passing records/i);
   assert.doesNotMatch(protocol, /nicola-rota/);
+});
+
+test("release notes remain explicitly gated before publication", async () => {
+  const [changelog, releaseNotes] = await Promise.all([
+    readFile(new URL("CHANGELOG.md", root), "utf8"),
+    readFile(new URL("docs/RELEASE-NOTES-v0.2.0-rc.1.md", root), "utf8"),
+  ]);
+  assert.match(changelog, /^## \[0\.2\.0-rc\.1\] - Unreleased$/m);
+  assert.match(changelog, /Two passing trials/);
+  assert.match(releaseNotes, /Status: prepared, not tagged or released/);
+  assert.match(releaseNotes, /must be created only after the two installation records pass/);
 });

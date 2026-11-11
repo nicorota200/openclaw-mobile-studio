@@ -50,7 +50,7 @@ command -v openclaw
 command -v npm
 ```
 
-Edit the environment file. Replace every `/home/your-user` placeholder, set `OPENCLAW_BIN` to the absolute result of `command -v openclaw`, and set `PATH` if `npm`, Git, OpenClaw, or SSH are outside the systemd user manager's default path. Keep `HOST=127.0.0.1` and begin with `MOBILE_STUDIO_GIT_MODE=read`.
+Edit the environment file. Replace every `/home/your-user` placeholder, set `OPENCLAW_BIN` to the absolute result of `command -v openclaw`, and set `PATH` if `npm`, Git, OpenClaw, or SSH are outside the systemd user manager's default path. Keep `HOST=127.0.0.1`, leave `MOBILE_STUDIO_TOKEN` empty because the standard PWA does not submit bearer credentials, and begin with `MOBILE_STUDIO_GIT_MODE=read`.
 
 The environment file is compatible with systemd and Node's `--env-file` parser. Do not commit it or copy its contents into issue reports.
 
@@ -194,4 +194,4 @@ Mobile Studio does not own OpenClaw, Tailscale, Git, project repositories, or Ga
 - `WARN`: operation can continue only when the warning is expected, such as Serve not yet configured before first start.
 - `FAIL`: installation or upgrade must stop.
 
-Doctor uses read-only Gateway calls (`health`, `status`, and `sessions.list`), does not send chat messages, does not mutate repositories, and never prints `MOBILE_STUDIO_TOKEN`.
+Doctor uses read-only Gateway calls (`health`, `status`, and `sessions.list`), does not send chat messages, does not mutate repositories, and never prints `MOBILE_STUDIO_TOKEN`. It fails when that variable is set because bearer authentication is not implemented by the standard PWA.

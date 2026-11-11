@@ -90,6 +90,7 @@ try {
   const mountedUrl = `http://127.0.0.1:${port}/mobile-studio`;
   const health = await waitForJson(`${mountedUrl}/api/health`, child, output);
   assert(health.ok === true, "production health probe did not confirm the fixture Gateway");
+  assert(health.mobileStudio?.version === "0.2.0-rc.1", "production health probe reported the wrong version");
   assert(health.mobileStudio?.gitMode === "read", "production smoke did not start in Git read mode");
   assert(health.mobileStudio?.basePath === "/mobile-studio", "production smoke used the wrong base path");
 
