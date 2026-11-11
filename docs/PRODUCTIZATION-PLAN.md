@@ -2,6 +2,8 @@
 
 Status: approved direction, implementation starting from the live v0.1 baseline.
 
+Phase 1 implementation note: `MOBILE_STUDIO_GIT_MODE` is server-authoritative, defaults to `read`, and requires a restart to change. The frontend reads the active non-secret mode from `/api/config`; `/api/health` reports the same value. Direct Git mutation routes remain unavailable unless the server starts in `write` mode.
+
 ## Release and branch policy
 
 - `main` is the stable personal/live baseline.

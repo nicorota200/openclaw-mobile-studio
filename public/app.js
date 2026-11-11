@@ -54,6 +54,7 @@ const state = {
   messageRenderSignature: "",
   confirmationKey: "",
   confirmationTimer: null,
+  gitMode: "read",
 };
 
 const messageCachePrefix = "oms.messages.";
@@ -164,6 +165,7 @@ const els = {
   projectWorkbench: document.getElementById("projectWorkbench"),
   projectTitle: document.getElementById("projectTitle"),
   projectMeta: document.getElementById("projectMeta"),
+  gitModeBadge: document.getElementById("gitModeBadge"),
   projectChatButton: document.getElementById("projectChatButton"),
   branchSelect: document.getElementById("branchSelect"),
   branchMeta: document.getElementById("branchMeta"),
@@ -1709,8 +1711,13 @@ function renderBranchControl() {
   }
   els.branchSelect.value = info.branch;
   const counts = changeCounts(info);
-  els.branchSelect.disabled = counts.total > 0;
-  els.branchMeta.textContent = counts.total > 0 ? "Switch blocked: working tree has changes." : "Switch changes the repo branch for Codex too.";
+  const readOnly = state.gitMode !== "write";
+  els.branchSelect.disabled = readOnly || counts.total > 0;
+  els.branchMeta.textContent = readOnly
+    ? "Branch switching is disabled in Git read-only mode."
+    : counts.total > 0
+      ? "Switch blocked: working tree has changes."
+      : "Switch changes the repo branch for Codex too.";
 }
 
 function renderChatProjectStrip() {
@@ -1794,6 +1801,9 @@ function renderProjectWorkbench({ deferWhileComposing = false } = {}) {
   const activeProjectPath = projectPathFromFilePath();
   const showWorkbench = Boolean(activeProjectPath);
   const showProjectPanel = showWorkbench && state.projectTab !== "files";
+  els.gitModeBadge.textContent = state.gitMode === "write" ? "Git writes enabled" : "Git read only";
+  els.gitModeBadge.classList.toggle("write", state.gitMode === "write");
+  els.gitModeBadge.classList.toggle("read", state.gitMode !== "write");
   els.projectWorkbench.hidden = !showWorkbench;
   els.projectPanel.hidden = !showProjectPanel;
   for (const tab of els.projectTabs) tab.classList.toggle("active", tab.dataset.projectTab === state.projectTab);
@@ -1932,6 +1942,18 @@ function renderProjectGitActions(info) {
   const projectPath = info?.repositoryPath || projectPathFromFilePath() || state.selectedProjectPath;
   const panel = document.createElement("section");
   panel.className = "project-git-actions";
+
+  if (state.gitMode !== "write") {
+    panel.classList.add("read-only");
+    const heading = document.createElement("strong");
+    heading.textContent = "Git read only";
+    const note = document.createElement("p");
+    note.className = "project-git-actions-note";
+    note.textContent =
+      "Status, history, branches, changes, and diffs remain available. Enable MOBILE_STUDIO_GIT_MODE=write and restart the server to show guarded write controls.";
+    panel.append(heading, note);
+    return panel;
+  }
 
   const title = document.createElement("div");
   title.className = "project-git-actions-title";
@@ -2431,6 +2453,12 @@ async function refreshAll({ quiet = false } = {}) {
     renderMessages();
     setStatus(error.message, "error");
   }
+}
+
+async function loadRuntimeConfig() {
+  const config = await api("/api/config");
+  state.gitMode = config.gitMode === "write" ? "write" : "read";
+  renderProjectWorkbench();
 }
 
 async function loadFiles({ quiet = false } = {}) {
@@ -3266,9 +3294,14 @@ els.composer.addEventListener("submit", async (event) => {
   }
 });
 
-applyTheme();
-setView(["home", "chat", "files", "settings"].includes(state.activeView) ? state.activeView : "home");
-setFileScreen("browser");
-updateFileControls();
-refreshAll();
+async function initialize() {
+  applyTheme();
+  setView(["home", "chat", "files", "settings"].includes(state.activeView) ? state.activeView : "home");
+  setFileScreen("browser");
+  updateFileControls();
+  await loadRuntimeConfig();
+  await refreshAll();
+}
+
+initialize().catch((error) => setStatus(error.message, "error"));
 setInterval(() => refreshAll({ quiet: true }), 30000);

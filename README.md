@@ -10,8 +10,8 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 - Open pool sessions and attach or detach projects from Settings.
 - See active run state and stop active runs.
 - Browse allowed files read-only.
-- Inspect Git projects, branches, commits, changes, and diffs.
-- Run guarded Git actions: pull, stage all, unstage, commit, and push.
+- Inspect Git status, history, branches, changes, and diffs in the default read-only mode.
+- Optionally enable guarded Git writes: branch switch, pull, stage all, unstage, commit, and push.
 - Launch project-aware agent prompts such as review, explain diff, check, commit plan, and continue.
 - Attach Git projects to available chat sessions without stealing the currently selected chat.
 - Show a mobile Home/Inbox with active runs, changed projects, and recent audit activity.
@@ -23,6 +23,7 @@ The app is a small local Node.js service plus a PWA frontend. It is designed to 
 - It does not expose an arbitrary terminal.
 - It does not run agent tools directly from the browser.
 - It should not be exposed publicly without a separate security review.
+- It does not provide multi-user identity or authorization.
 
 ## Requirements
 
@@ -63,6 +64,7 @@ Environment variables:
 HOST=127.0.0.1
 PORT=8787
 MOBILE_STUDIO_TOKEN=
+MOBILE_STUDIO_GIT_MODE=read
 MOBILE_STUDIO_FILE_ROOT=/home/your-user
 OPENCLAW_BIN=/path/to/openclaw
 MOBILE_STUDIO_SESSION_POOL_SIZE=5
@@ -81,6 +83,19 @@ Authorization: Bearer <token>
 ```
 
 The service is intended to bind to loopback and sit behind a trusted private reverse proxy or VPN route.
+
+`MOBILE_STUDIO_GIT_MODE` accepts exactly `read` or `write` and defaults to `read` when unset. In `read` mode, Git inspection remains available while the server rejects every direct Git mutation route with `403 GIT_WRITES_DISABLED`. Set it to `write` and restart the service to expose the existing guarded branch switch, pull, stage, unstage, commit, and push actions. This is a server configuration, not an in-app toggle.
+
+## Trusted-tailnet Security Model
+
+The initial supported access boundary is a **single-user private Tailscale tailnet**:
+
+- Keep the backend bound to loopback (`HOST=127.0.0.1`).
+- Expose it only with Tailscale Serve and tailnet policy restricted to the owner.
+- Do not enable Tailscale Funnel or otherwise publish the route to the internet.
+- Treat every principal able to reach the Mobile Studio route as the authorized owner of all enabled capabilities.
+
+There is no application-level user identity or login in this phase. `MOBILE_STUDIO_TOKEN` remains an optional compatibility control, not a substitute for a correctly restricted tailnet. Shared tailnets, multiple users, and public exposure are outside the supported product contract.
 
 ## Sessions And Project Chats
 
@@ -134,9 +149,10 @@ Local quality baseline (no Gateway or browser required):
 npm ci --ignore-scripts
 npm run check
 npm test
+npm run browser:fixture
 ```
 
-`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, and streaming upload regressions. Server tests use disposable copies on OS-assigned loopback ports and never start or mutate the normal service or its session store.
+`check` runs Node syntax checks on `server.js` and JavaScript files under `lib/`, `public/`, `scripts/`, and `tests/`. It does not execute the application or perform semantic linting. `test` uses Node's built-in runner for pool concurrency/migration and Gateway-file immutability, per-session attachment state, project action prompts, audit metadata/read limits/rotation, streaming upload regressions, and isolated Git mode API behavior. `browser:fixture` serves disposable read/write UI fixtures and checks mode labeling and write-control visibility with local Chromium. These tests never start or mutate the normal service or its session store.
 
 GitHub Actions runs the same install, checks, and non-browser tests on push and pull request with Node 22.19 and 24. Browser tests are deliberately separate.
 
@@ -155,18 +171,20 @@ CHROMIUM_PATH=/path/to/chromium npm run visual:smoke
 
 Defaults are `http://127.0.0.1:8787/mobile-studio/` and `/snap/bin/chromium`. The suite includes mocked send/upload/fixed-pool interactions, per-session attachment switching, project-action attachment isolation, and a delayed Settings response regression, but it also reads live sessions, history, attention, audit, files, and Git information. It expects at least one session and the host projects `projects/Bluesky-moderation-analysis`, `projects/openclaw-mobile-studio`, and `projects/COCAttackAnalyzer` (with enough commits to scroll). API latency thresholds also depend on host load. These requirements make the full suite unsuitable for generic CI without fixtures. Settings must render actual session rows; the assertion waits up to 35 seconds for asynchronous loading and still fails if no rows appear.
 
-Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; the isolated upload tests cover the stabilization's server fixes.
+Run this suite only against a trusted local environment. Mutation interactions are mocked; live project checks inspect Git controls without executing Git writes. Screenshots may contain local information and are written under ignored `test-artifacts/`. Running against another checkout validates that checkout's served frontend, not unserved local server changes; isolated server tests cover backend behavior.
 
 See [v0.1 stabilization notes](docs/STABILIZATION-v0.1.md) for the local proof and remaining review concerns.
 
 ## Security Notes
 
 - Keep the service private by default.
+- Keep the backend loopback-only and the Tailscale route private; never enable Funnel for the supported trusted-tailnet mode.
+- Anyone who can reach the route is treated as the authorized single owner; use restrictive tailnet membership and policy.
 - Keep `MOBILE_STUDIO_FILE_ROOT` narrow.
 - File preview blocks common secret/key/database filenames.
 - Mobile-originated chat sends use `deliver:false` so they do not automatically post to external channels.
 - Project action buttons and risky slash commands require a deliberate second tap/click.
-- Git write actions are guarded and do not force-push, rebase, stash, or resolve conflicts.
+- Git writes are disabled by default. When explicitly enabled, actions remain guarded and do not force-push, rebase, stash, or resolve conflicts.
 - Audit logs are local, append-only JSONL, rotate at 1 MB, store metadata only, and use server-selected send event types.
 
 ## License

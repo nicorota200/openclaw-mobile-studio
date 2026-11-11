@@ -36,12 +36,23 @@ function boundedIntegerEnv(name, fallback, min, max) {
   return value;
 }
 
+function gitModeEnv() {
+  const raw = process.env.MOBILE_STUDIO_GIT_MODE;
+  if (raw === undefined || raw === "") return "read";
+  if (raw === "read" || raw === "write") return raw;
+  throw new Error(
+    `MOBILE_STUDIO_GIT_MODE must be "read" or "write"; received ${JSON.stringify(raw)}. ` +
+      "Use read (the default) to block Git mutations or write to enable guarded Git actions.",
+  );
+}
+
 const sessionPoolSize = boundedIntegerEnv(
   "MOBILE_STUDIO_SESSION_POOL_SIZE",
   5,
   sessionPoolSizeMin,
   sessionPoolSizeMax,
 );
+const gitMode = gitModeEnv();
 const fileRoot = resolve(process.env.MOBILE_STUDIO_FILE_ROOT || "/home/nicola-rota");
 const filePreviewLimit = 200 * 1024;
 const diffPreviewLimit = 80_000;
@@ -685,6 +696,7 @@ async function getHealth() {
       host,
       port,
       fileRoot,
+      gitMode,
     },
     gateway: {
       health,
@@ -2020,6 +2032,10 @@ async function handleApi(req, res, url) {
       sendJson(res, 200, await getHealth());
       return;
     }
+    if (req.method === "GET" && url.pathname === "/api/config") {
+      sendJson(res, 200, { ok: true, gitMode });
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/api/sessions") {
       sendJson(res, 200, await listSessions());
       return;
@@ -2084,12 +2100,30 @@ async function handleApi(req, res, url) {
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/project/branch") {
+      if (gitMode !== "write") {
+        sendError(
+          res,
+          403,
+          "GIT_WRITES_DISABLED",
+          "Git writes are disabled. Set MOBILE_STUDIO_GIT_MODE=write and restart Mobile Studio to enable guarded writes.",
+        );
+        return;
+      }
       const result = await switchProjectBranch(req);
       if (!result.ok) sendError(res, result.status, result.code, result.message);
       else sendJson(res, 200, result);
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/project/git-action") {
+      if (gitMode !== "write") {
+        sendError(
+          res,
+          403,
+          "GIT_WRITES_DISABLED",
+          "Git writes are disabled. Set MOBILE_STUDIO_GIT_MODE=write and restart Mobile Studio to enable guarded writes.",
+        );
+        return;
+      }
       const result = await runProjectGitAction(req);
       if (!result.ok) sendError(res, result.status, result.code, result.message);
       else sendJson(res, 200, result);

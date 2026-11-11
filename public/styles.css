@@ -1485,6 +1485,26 @@ h2 {
   white-space: nowrap;
 }
 
+.git-mode-badge {
+  display: inline-flex;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 10px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.git-mode-badge.write {
+  border-color: rgba(77, 182, 172, 0.5);
+  color: var(--accent-strong);
+  background: var(--accent-panel);
+}
+
 .branch-control {
   display: grid;
   gap: 4px;
@@ -1595,6 +1615,10 @@ h2 {
   border: 1px solid rgba(44, 63, 78, 0.82);
   border-radius: 8px;
   background: var(--section-bg);
+}
+
+.project-git-actions.read-only {
+  border-style: dashed;
 }
 
 .project-action-launcher {
