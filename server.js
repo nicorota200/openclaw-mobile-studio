@@ -185,6 +185,7 @@ function uploadDirectoryPath(name) {
 
 function validateUploadManifest(manifest, id, fileInfo, { allowExpired = false } = {}) {
   const uploadDir = uploadDirectoryPath(id);
+  const manifestPath = uploadMetaPath(id);
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata is malformed.");
   }
@@ -196,7 +197,9 @@ function validateUploadManifest(manifest, id, fileInfo, { allowExpired = false }
     !manifest.name ||
     !Number.isSafeInteger(manifest.size) ||
     manifest.size < 0 ||
+    manifest.path !== filePath ||
     dirname(filePath) !== uploadDir ||
+    filePath === manifestPath ||
     !Number.isFinite(expiresAt) ||
     !fileInfo?.isFile() ||
     fileInfo.isSymbolicLink() ||
@@ -211,9 +214,29 @@ function validateUploadManifest(manifest, id, fileInfo, { allowExpired = false }
 }
 
 async function loadUploadManifest(id, options) {
+  const uploadDir = uploadDirectoryPath(id);
+  const manifestPath = uploadMetaPath(id);
+  let directoryInfo;
+  let manifestInfo;
+  try {
+    directoryInfo = await lstat(uploadDir);
+    if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+      throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment directory is malformed.");
+    }
+    manifestInfo = await lstat(manifestPath);
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    if (error?.code === "ENOENT") {
+      throw new HttpError(404, "ATTACHMENT_NOT_FOUND", "Attachment was not found; upload it again.");
+    }
+    throw error;
+  }
+  if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) {
+    throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata is malformed.");
+  }
   let manifest;
   try {
-    manifest = JSON.parse(await readFile(uploadMetaPath(id), "utf8"));
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch (error) {
     if (error?.code === "ENOENT") {
       throw new HttpError(404, "ATTACHMENT_NOT_FOUND", "Attachment was not found; upload it again.");
@@ -223,9 +246,15 @@ async function loadUploadManifest(id, options) {
     }
     throw error;
   }
-  const uploadDir = uploadDirectoryPath(id);
   const filePath = resolve(typeof manifest?.path === "string" ? manifest.path : "");
-  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) || dirname(filePath) !== uploadDir) {
+  if (
+    !manifest ||
+    typeof manifest !== "object" ||
+    Array.isArray(manifest) ||
+    manifest.path !== filePath ||
+    dirname(filePath) !== uploadDir ||
+    filePath === manifestPath
+  ) {
     throw new HttpError(400, "INVALID_ATTACHMENT_MANIFEST", "Attachment metadata or payload is malformed.");
   }
   let fileInfo;
@@ -1248,34 +1277,76 @@ function timestampMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function normalizeAppSessionState(raw) {
-  const state = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const projectBindings =
-    state.projectBindings && typeof state.projectBindings === "object" && !Array.isArray(state.projectBindings)
-      ? state.projectBindings
-      : {};
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value, keys) {
+  if (!isPlainObject(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function hasValidProjectBindings(projectBindings) {
+  return (
+    isPlainObject(projectBindings) &&
+    Object.entries(projectBindings).every(
+      ([sessionKey, projectPath]) =>
+        sessionKey.length > 0 &&
+        sessionKey === sessionKey.trim() &&
+        typeof projectPath === "string" &&
+        projectPath.length > 0 &&
+        projectPath === projectPath.trim(),
+    )
+  );
+}
+
+function isValidV1SessionState(state) {
+  return hasExactKeys(state, ["version", "projectBindings"]) && state.version === 1 && hasValidProjectBindings(state.projectBindings);
+}
+
+function isValidV2SessionState(state) {
+  if (
+    !hasExactKeys(state, ["version", "poolEntries", "projectBindings"]) ||
+    state.version !== 2 ||
+    !Array.isArray(state.poolEntries) ||
+    !hasValidProjectBindings(state.projectBindings)
+  ) {
+    return false;
+  }
   const seenPoolKeys = new Set();
-  const poolEntries = (Array.isArray(state.poolEntries) ? state.poolEntries : [])
-    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
-    .map((entry) => ({
-      key: typeof entry.key === "string" ? entry.key.trim() : "",
-      displayName: typeof entry.displayName === "string" ? entry.displayName.trim().slice(0, 80) : "",
-      createdAt: typeof entry.createdAt === "string" ? entry.createdAt : "",
-    }))
-    .filter((entry) => {
-      if (!entry.key || seenPoolKeys.has(entry.key)) return false;
-      seenPoolKeys.add(entry.key);
-      return true;
-    });
-  return {
-    version: 2,
-    poolEntries,
-    projectBindings: Object.fromEntries(
-      Object.entries(projectBindings)
-        .filter(([sessionKey, projectPath]) => typeof sessionKey === "string" && typeof projectPath === "string")
-        .map(([sessionKey, projectPath]) => [sessionKey, projectPath]),
-    ),
-  };
+  return state.poolEntries.every((entry) => {
+    if (!hasExactKeys(entry, ["key", "displayName", "createdAt"])) return false;
+    if (
+      typeof entry.key !== "string" ||
+      !entry.key ||
+      entry.key !== entry.key.trim() ||
+      seenPoolKeys.has(entry.key) ||
+      typeof entry.displayName !== "string" ||
+      !entry.displayName ||
+      entry.displayName !== entry.displayName.trim() ||
+      entry.displayName.length > 80 ||
+      typeof entry.createdAt !== "string" ||
+      !entry.createdAt ||
+      !Number.isFinite(Date.parse(entry.createdAt))
+    ) {
+      return false;
+    }
+    seenPoolKeys.add(entry.key);
+    return true;
+  });
+}
+
+function migrateAppSessionState(state) {
+  if (state.version === 2) {
+    return {
+      version: 2,
+      poolEntries: state.poolEntries.map((entry) => ({ ...entry })),
+      projectBindings: { ...state.projectBindings },
+    };
+  }
+  return { version: 2, poolEntries: [], projectBindings: { ...state.projectBindings } };
 }
 
 async function readAppSessionState() {
@@ -1283,7 +1354,7 @@ async function readAppSessionState() {
   try {
     raw = await readFile(appSessionStatePath, "utf8");
   } catch (error) {
-    if (error?.code === "ENOENT") return normalizeAppSessionState(null);
+    if (error?.code === "ENOENT") return { version: 2, poolEntries: [], projectBindings: {} };
     throw new HttpError(
       500,
       "SESSION_STATE_UNREADABLE",
@@ -1300,47 +1371,21 @@ async function readAppSessionState() {
       `Cannot parse ${appSessionStatePath}; preserve it and restore a known-good backup before retrying.`,
     );
   }
-  if (
-    !parsed ||
-    typeof parsed !== "object" ||
-    Array.isArray(parsed) ||
-    (parsed.version !== undefined && parsed.version !== 1 && parsed.version !== 2) ||
-    (parsed.poolEntries !== undefined && !Array.isArray(parsed.poolEntries)) ||
-    (parsed.projectBindings !== undefined &&
-      (!parsed.projectBindings || typeof parsed.projectBindings !== "object" || Array.isArray(parsed.projectBindings))) ||
-    (Array.isArray(parsed.poolEntries) &&
-      parsed.poolEntries.some(
-        (entry) =>
-          !entry ||
-          typeof entry !== "object" ||
-          Array.isArray(entry) ||
-          typeof entry.key !== "string" ||
-          !entry.key.trim() ||
-          entry.key !== entry.key.trim() ||
-          (entry.displayName !== undefined &&
-            (typeof entry.displayName !== "string" || entry.displayName !== entry.displayName.trim() || entry.displayName.length > 80)) ||
-          (entry.createdAt !== undefined && typeof entry.createdAt !== "string"),
-      )) ||
-    (Array.isArray(parsed.poolEntries) &&
-      new Set(parsed.poolEntries.map((entry) => entry?.key)).size !== parsed.poolEntries.length) ||
-    (parsed.projectBindings &&
-      Object.entries(parsed.projectBindings).some(
-        ([sessionKey, projectPath]) => !sessionKey.trim() || typeof projectPath !== "string" || !projectPath,
-      ))
-  ) {
+  if (!isValidV1SessionState(parsed) && !isValidV2SessionState(parsed)) {
     throw new HttpError(
       500,
       "SESSION_STATE_CORRUPT",
       `${appSessionStatePath} has an invalid structure; preserve it and restore a known-good backup before retrying.`,
     );
   }
-  return normalizeAppSessionState(parsed);
+  return migrateAppSessionState(parsed);
 }
 
 async function writeAppSessionState(state) {
+  if (!isValidV2SessionState(state)) throw new Error("Refusing to write invalid v2 session state.");
   await mkdir(dataDir, { recursive: true });
   const tmp = `${appSessionStatePath}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(normalizeAppSessionState(state), null, 2)}\n`, { mode: 0o600 });
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, appSessionStatePath);
 }
 
@@ -1540,6 +1585,12 @@ function normalizeTask(task) {
   };
 }
 
+function scopedTasks(rawTasks, activeSessionKeys) {
+  return rawTasks
+    .map(normalizeTask)
+    .filter((task) => task.sessionKey && activeSessionKeys.has(task.sessionKey));
+}
+
 async function getRunState(url) {
   const sessionKey = url.searchParams.get("sessionKey") || "";
   const includeDetails = url.searchParams.get("details") === "1";
@@ -1560,11 +1611,8 @@ async function getRunState(url) {
     : [{ status: "fulfilled", value: { tasks: [] } }, { status: "fulfilled", value: null }];
 
   const tasksRaw = tasksResult.status === "fulfilled" && Array.isArray(tasksResult.value.tasks) ? tasksResult.value.tasks : [];
-  const tasks = tasksRaw
-    .map(normalizeTask)
-    .filter((task) => !task.sessionKey || task.sessionKey === sessionKey)
-    .sort((a, b) => taskTimestamp(b) - taskTimestamp(a))
-    .slice(0, 8);
+  const scoped = scopedTasks(tasksRaw, new Set([sessionKey])).sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
+  const tasks = scoped.slice(0, 8);
   const approvals = approvalsResult.status === "fulfilled" ? approvalsResult.value : null;
 
   return {
@@ -1573,7 +1621,7 @@ async function getRunState(url) {
     session,
     source: sessionSource,
     tasks,
-    taskCount: tasksRaw.length,
+    taskCount: scoped.length,
     approvals: approvals
       ? {
           configured: approvals.exists === true,
@@ -1618,6 +1666,21 @@ function attentionTaskTitle(task) {
   return String(task.title || task.id || "Task").replace(/\s+/g, " ").trim();
 }
 
+function sanitizeAuditEventForPool(event, activePoolKeys) {
+  if (!isPlainObject(event?.meta)) return event;
+  if (!Object.hasOwn(event.meta, "sessionKey")) return event;
+  const sessionKey = event.meta.sessionKey;
+  if (typeof sessionKey === "string" && activePoolKeys.has(sessionKey)) return event;
+  const { sessionKey: _externalSessionKey, agentId: _externalAgentId, ...meta } = event.meta;
+  return { ...event, meta };
+}
+
+async function readPoolAuditEvents(limit, activePoolKeys) {
+  const keys = activePoolKeys || new Set(activePoolEntries(await ensureAppSessionPool()).map((entry) => entry.key));
+  const events = await readAuditEvents(auditLogPath, limit);
+  return events.map((event) => sanitizeAuditEventForPool(event, keys));
+}
+
 async function getAttention(url = new URL("http://local/api/attention")) {
   const includeDetails = url.searchParams.get("details") === "1";
   const [sessionsResult, projectsResult, tasksResult, approvalsResult, healthResult] = await Promise.allSettled([
@@ -1632,17 +1695,10 @@ async function getAttention(url = new URL("http://local/api/attention")) {
   const activePoolKeys = new Set(sessions.map((session) => session.key));
   const projects = projectsResult.status === "fulfilled" ? projectsResult.value.projects || [] : [];
   const rawTasks = tasksResult.status === "fulfilled" && Array.isArray(tasksResult.value.tasks) ? tasksResult.value.tasks : [];
-  const tasks = rawTasks
-    .map(normalizeTask)
-    .filter((task) => !task.sessionKey || activePoolKeys.has(task.sessionKey))
-    .sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
+  const tasks = scopedTasks(rawTasks, activePoolKeys).sort((a, b) => taskTimestamp(b) - taskTimestamp(a));
   const approvals = approvalsResult.status === "fulfilled" ? approvalsResult.value : null;
   const health = healthResult.status === "fulfilled" ? healthResult.value : null;
-  const auditEvents = (await readAuditEvents(auditLogPath, 8).catch(() => [])).map((event) => {
-    if (!event?.meta?.sessionKey || activePoolKeys.has(event.meta.sessionKey)) return event;
-    const { sessionKey: _externalSessionKey, ...meta } = event.meta;
-    return { ...event, meta };
-  });
+  const auditEvents = await readPoolAuditEvents(8, activePoolKeys).catch(() => []);
 
   const items = [];
   for (const session of sessions.filter(isAttentionActiveSession).slice(0, 5)) {
@@ -1825,7 +1881,19 @@ async function classifySendAudit(rawAudit, sessionKey, attachments) {
       "Project action audit metadata must match the project attached to this session.",
     );
   }
-  return { type: "project_action", meta: { ...meta, action, projectPath, branch } };
+  let repositoryBranch = "";
+  try {
+    const repo = await getRepoRootFromPath(projectPath);
+    if (repo.ok && repo.isRepo && repo.rootDisplayPath === projectPath) {
+      repositoryBranch = (await runCommand("git", ["-C", repo.rootReal, "branch", "--show-current"], { timeoutMs: 5000 })).trim();
+    }
+  } catch {
+    // Audit remains useful without a branch when the bound repository cannot be safely inspected.
+  }
+  return {
+    type: "project_action",
+    meta: { action, projectPath, ...(repositoryBranch ? { branch: repositoryBranch } : {}) },
+  };
 }
 
 function attachmentPromptBlock(attachments) {
@@ -1990,7 +2058,7 @@ async function handleApi(req, res, url) {
     }
     if (req.method === "GET" && url.pathname === "/api/audit") {
       const limit = Number.parseInt(url.searchParams.get("limit") || "40", 10);
-      sendJson(res, 200, { ok: true, events: await readAuditEvents(auditLogPath, limit) });
+      sendJson(res, 200, { ok: true, events: await readPoolAuditEvents(limit) });
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/files") {

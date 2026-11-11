@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attachmentItemsForSend, attachmentQueue, removeAttachmentItems } from "../public/attachment-state.js";
+import {
+  attachmentFilesWithinLimit,
+  attachmentItemsForSend,
+  attachmentQueue,
+  removeAttachmentItems,
+} from "../public/attachment-state.js";
 
 function fixture() {
   return { pendingAttachmentsBySession: {} };
@@ -30,4 +35,19 @@ test("project-action sends opt out without consuming composer attachments", () =
 
   assert.deepEqual(attachmentItemsForSend(state, "session-a", false), []);
   assert.equal(attachmentQueue(state, "session-a")[0], ready);
+});
+
+test("repeated file selections share one total per-session attachment limit", () => {
+  const state = fixture();
+  const first = attachmentFilesWithinLimit(state, "session-a", ["one", "two", "three"]);
+  attachmentQueue(state, "session-a").push(...first.map((name) => ({ name, status: "uploading" })));
+
+  const second = attachmentFilesWithinLimit(state, "session-a", ["four", "five", "six"]);
+  attachmentQueue(state, "session-a").push(...second.map((name) => ({ name, status: "uploading" })));
+
+  assert.deepEqual(first, ["one", "two", "three"]);
+  assert.deepEqual(second, ["four", "five"]);
+  assert.equal(attachmentQueue(state, "session-a").length, 5);
+  assert.deepEqual(attachmentFilesWithinLimit(state, "session-a", ["seven"]), []);
+  assert.deepEqual(attachmentFilesWithinLimit(state, "session-b", ["other"]), ["other"]);
 });

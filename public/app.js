@@ -1,5 +1,10 @@
 import { projectActionLabel, projectActionPrompt, projectActions } from "./project-actions.js";
-import { attachmentItemsForSend, attachmentQueue, removeAttachmentItems } from "./attachment-state.js";
+import {
+  attachmentFilesWithinLimit,
+  attachmentItemsForSend,
+  attachmentQueue,
+  removeAttachmentItems,
+} from "./attachment-state.js";
 
 const initialParams = new URLSearchParams(window.location.search);
 
@@ -2755,7 +2760,9 @@ function renderAttachments() {
 async function addAttachmentFiles(files) {
   const sessionKey = state.selectedSessionKey;
   if (!sessionKey) return;
-  const selected = Array.from(files || []).slice(0, 5);
+  const candidates = Array.from(files || []);
+  const selected = attachmentFilesWithinLimit(state, sessionKey, candidates, 5);
+  if (selected.length < candidates.length) setStatus("Attach at most 5 files per session.", "error");
   if (selected.length === 0) return;
   for (const file of selected) {
     const item = {

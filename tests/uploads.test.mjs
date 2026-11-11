@@ -276,6 +276,49 @@ test("upload maintenance removes expired, malformed, partial, and orphaned direc
   server.assertAlive();
 });
 
+test("upload maintenance rejects manifest and payload symlinks without touching their targets", async (t) => {
+  const server = await startUploadServer(t);
+  const uploadRoot = join(server.dir, "uploads");
+  const outsideRoot = join(server.dir, "outside-upload-targets");
+  await mkdir(uploadRoot, { recursive: true });
+  await mkdir(outsideRoot);
+
+  const externalManifest = join(outsideRoot, "manifest-target.json");
+  const externalPayload = join(outsideRoot, "payload-target.txt");
+  await writeFile(externalManifest, '{"poisoned":true}\n');
+  await writeFile(externalPayload, "outside payload must survive");
+
+  const manifestLinkId = "55555555-5555-4555-8555-555555555555";
+  const manifestLinkDir = join(uploadRoot, manifestLinkId);
+  await mkdir(manifestLinkDir);
+  await symlink(externalManifest, join(manifestLinkDir, "manifest.json"), "file");
+
+  const payloadLinkId = "66666666-6666-4666-8666-666666666666";
+  const payloadLinkDir = join(uploadRoot, payloadLinkId);
+  const payloadLinkPath = join(payloadLinkDir, "file-linked.txt");
+  await mkdir(payloadLinkDir);
+  await symlink(externalPayload, payloadLinkPath, "file");
+  await writeFile(
+    join(payloadLinkDir, "manifest.json"),
+    JSON.stringify({
+      id: payloadLinkId,
+      name: "linked.txt",
+      size: 28,
+      path: payloadLinkPath,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }),
+  );
+
+  const response = await upload(server, "valid.txt", "valid");
+  assert.equal(response.status, 200);
+  const { attachment } = await response.json();
+  assert.deepEqual(await readdir(uploadRoot), [attachment.id]);
+  assert.equal(await readFile(externalManifest, "utf8"), '{"poisoned":true}\n');
+  assert.equal(await readFile(externalPayload, "utf8"), "outside payload must survive");
+  assert.equal(await readFile(attachment.path, "utf8"), "valid");
+  server.assertAlive();
+});
+
 test("aggregate upload capacity is enforced across completed uploads", async (t) => {
   const server = await startUploadServer(t, { maxTotalBytes: 8 });
   assert.equal((await upload(server, "first.txt", "12345")).status, 200);

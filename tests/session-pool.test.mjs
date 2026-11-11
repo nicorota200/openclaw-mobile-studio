@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
+
+const execFileAsync = promisify(execFile);
 
 async function preparePoolServer(t, gatewaySessions = [], gatewayResponses = {}) {
   const dir = await mkdtemp(join(tmpdir(), "oms-pool-test-"));
@@ -151,6 +154,49 @@ test("malformed app session state is preserved and returns an actionable API err
   server.assertAlive();
 });
 
+test("shapeless session state is preserved byte-for-byte without a temp rewrite", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const statePath = join(fixture.dir, "data", "session-state.json");
+  const shapeless = "{}\n";
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(statePath, shapeless);
+
+  const server = await fixture.start(2);
+  const response = await fetch(`${server.url}/api/sessions`);
+
+  assert.equal(response.status, 500);
+  assert.equal((await response.json()).error.code, "SESSION_STATE_CORRUPT");
+  assert.equal(await readFile(statePath, "utf8"), shapeless);
+  assert.deepEqual((await readdir(join(fixture.dir, "data"))).filter((name) => name.includes(".tmp")), []);
+  server.assertAlive();
+});
+
+test("unknown versions and missing required versioned fields fail closed", async (t) => {
+  const cases = [
+    ["missing version", { projectBindings: {} }],
+    ["unknown version", { version: 3, poolEntries: [], projectBindings: {} }],
+    ["incomplete v1", { version: 1 }],
+    ["incomplete v2 registry", { version: 2, projectBindings: {} }],
+  ];
+  for (const [name, state] of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = await preparePoolServer(subtest);
+      const statePath = join(fixture.dir, "data", "session-state.json");
+      const original = `${JSON.stringify(state)}\n`;
+      await mkdir(join(fixture.dir, "data"), { recursive: true });
+      await writeFile(statePath, original);
+      const server = await fixture.start(1);
+
+      const response = await fetch(`${server.url}/api/sessions`);
+      assert.equal(response.status, 500);
+      assert.equal((await response.json()).error.code, "SESSION_STATE_CORRUPT");
+      assert.equal(await readFile(statePath, "utf8"), original);
+      assert.deepEqual((await readdir(join(fixture.dir, "data"))).filter((entry) => entry.includes(".tmp")), []);
+      server.assertAlive();
+    });
+  }
+});
+
 test("unreadable existing app session state is not treated as missing", async (t) => {
   const fixture = await preparePoolServer(t);
   const statePath = join(fixture.dir, "data", "session-state.json");
@@ -205,6 +251,31 @@ test("v1 project bindings seed migration without deleting the binding", async (t
   const payload = await fetch(`${server.url}/api/sessions`).then((response) => response.json());
   assert.equal(payload.sessions[0].key, legacyKey);
   assert.equal(payload.sessions[0].projectPath, "projects/kept");
+  const migrated = JSON.parse(await readFile(join(fixture.dir, "data", "session-state.json"), "utf8"));
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.projectBindings[legacyKey], "projects/kept");
+  assert.equal(migrated.poolEntries[0].key, legacyKey);
+});
+
+test("a complete v2 registry operates without rewriting its bytes", async (t) => {
+  const fixture = await preparePoolServer(t);
+  const poolKey = "agent:main:mobile-studio:session:pool-1";
+  const statePath = join(fixture.dir, "data", "session-state.json");
+  const original = `${JSON.stringify({
+    version: 2,
+    poolEntries: [{ key: poolKey, displayName: "Mobile Studio 1", createdAt: "2026-11-11T00:00:00.000Z" }],
+    projectBindings: {},
+  })}\n`;
+  await mkdir(join(fixture.dir, "data"), { recursive: true });
+  await writeFile(statePath, original);
+  const server = await fixture.start(1);
+
+  const response = await fetch(`${server.url}/api/sessions`);
+  const payload = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(payload.sessions[0].key, poolKey);
+  assert.equal(await readFile(statePath, "utf8"), original);
+  assert.deepEqual((await readdir(join(fixture.dir, "data"))).filter((entry) => entry.includes(".tmp")), []);
 });
 
 test("v1 migration preserves every binding through pool shrink and later growth", async (t) => {
@@ -272,9 +343,10 @@ test("abort forwards only the authorized pool key and run id", async (t) => {
   ]);
 });
 
-test("attention and run-state never expose external task session keys", async (t) => {
+test("attention and run-state exclude unscoped and external tasks before sorting and slicing", async (t) => {
   const poolKey = "agent:main:mobile-studio:session:pool-1";
   const externalKey = "agent:main:unrelated";
+  const externalAgentId = "external-agent-secret";
   const fixture = await preparePoolServer(
     t,
     [{ key: poolKey, sessionId: "pool-session", agentId: "main" }],
@@ -282,11 +354,16 @@ test("attention and run-state never expose external task session keys", async (t
       "tasks.list": {
         tasks: [
           ...Array.from({ length: 8 }, (_, index) => ({
-            id: `external-task-${index + 1}`,
+            id: `unscoped-task-${index + 1}`,
             status: "waiting",
-            sessionKey: externalKey,
             updatedAt: `2026-11-11T12:${String(index).padStart(2, "0")}:00.000Z`,
           })),
+          {
+            id: "external-task",
+            status: "waiting",
+            sessionKey: externalKey,
+            updatedAt: "2026-11-11T11:00:00.000Z",
+          },
           { id: "pool-task", status: "running", sessionKey: poolKey, updatedAt: "2026-11-10T00:00:00.000Z" },
         ],
       },
@@ -295,46 +372,104 @@ test("attention and run-state never expose external task session keys", async (t
   await mkdir(join(fixture.dir, "data"), { recursive: true });
   await writeFile(
     join(fixture.dir, "data", "audit-log.jsonl"),
-    `${JSON.stringify({
-      id: "external-session-project-action",
-      ts: new Date().toISOString(),
-      type: "project_action",
-      meta: {
-        sessionKey: externalKey,
-        action: "review_changes",
-        projectPath: "projects/example",
+    [
+      {
+        id: "external-session-project-action",
+        ts: new Date(Date.now() - 2000).toISOString(),
+        type: "project_action",
+        meta: {
+          sessionKey: externalKey,
+          agentId: externalAgentId,
+          action: "review_changes",
+          projectPath: "projects/example",
+        },
       },
-    })}\n`,
+      {
+        id: "pool-session-project-action",
+        ts: new Date(Date.now() - 1000).toISOString(),
+        type: "project_action",
+        meta: {
+          sessionKey: poolKey,
+          agentId: "main",
+          action: "review_changes",
+          projectPath: "projects/example",
+        },
+      },
+      {
+        id: "project-git-metadata",
+        ts: new Date().toISOString(),
+        type: "git_action",
+        meta: { action: "stage_all", projectPath: "projects/example", branch: "main", changed: true },
+      },
+    ].map((event) => JSON.stringify(event)).join("\n") + "\n",
   );
   const server = await fixture.start(2);
 
   const attention = await fetch(`${server.url}/api/attention?details=1`).then((response) => response.json());
   assert.equal(attention.items.some((item) => item.id === "task:pool-task" && item.sessionKey === poolKey), true);
-  assert.equal(attention.items.some((item) => item.id.startsWith("task:external-task") || item.sessionKey === externalKey), false);
-  assert.equal(attention.recentTasks.some((task) => task.id.startsWith("external-task") || task.sessionKey === externalKey), false);
+  assert.equal(attention.items.some((item) => item.id.includes("unscoped-task") || item.sessionKey === externalKey), false);
+  assert.equal(
+    attention.recentTasks.some((task) => task.id.includes("unscoped-task") || task.id === "external-task" || task.sessionKey === externalKey),
+    false,
+  );
   assert.equal(attention.summary.activeTasks, 1);
-  assert.deepEqual(attention.auditEvents[0].meta, {
+  assert.deepEqual(attention.auditEvents.find((event) => event.id === "external-session-project-action").meta, {
     action: "review_changes",
     projectPath: "projects/example",
+  });
+  assert.deepEqual(attention.auditEvents.find((event) => event.id === "pool-session-project-action").meta, {
+    sessionKey: poolKey,
+    agentId: "main",
+    action: "review_changes",
+    projectPath: "projects/example",
+  });
+  assert.deepEqual(attention.auditEvents.find((event) => event.id === "project-git-metadata").meta, {
+    action: "stage_all",
+    projectPath: "projects/example",
+    branch: "main",
+    changed: true,
   });
 
   const runState = await fetch(
     `${server.url}/api/run-state?details=1&sessionKey=${encodeURIComponent(poolKey)}`,
   ).then((response) => response.json());
   assert.deepEqual(runState.tasks.map((task) => task.id), ["pool-task"]);
-  assert.equal(JSON.stringify({ attention, runState }).includes(externalKey), false);
+  assert.equal(runState.taskCount, 1);
+
+  const rawAudit = await fetch(`${server.url}/api/audit?limit=8`).then((response) => response.json());
+  assert.deepEqual(rawAudit.events.find((event) => event.id === "external-session-project-action").meta, {
+    action: "review_changes",
+    projectPath: "projects/example",
+  });
+  assert.deepEqual(rawAudit.events.find((event) => event.id === "pool-session-project-action").meta, {
+    sessionKey: poolKey,
+    agentId: "main",
+    action: "review_changes",
+    projectPath: "projects/example",
+  });
+  assert.deepEqual(rawAudit.events.find((event) => event.id === "project-git-metadata").meta, {
+    action: "stage_all",
+    projectPath: "projects/example",
+    branch: "main",
+    changed: true,
+  });
+  assert.equal(JSON.stringify({ attention, runState, rawAudit }).includes(externalKey), false);
+  assert.equal(JSON.stringify({ attention, runState, rawAudit }).includes(externalAgentId), false);
 });
 
-test("send accepts only a bound, allowed project action and protects calculated audit metadata", async (t) => {
+test("send accepts only a bound project action and derives its audit branch from the repository", async (t) => {
   const poolKey = "agent:main:mobile-studio:session:pool-1";
   const fixture = await preparePoolServer(t);
+  const repositoryPath = join(fixture.dir, "bound-repository");
+  await mkdir(repositoryPath);
+  await execFileAsync("git", ["init", "-b", "trusted-server-branch", repositoryPath]);
   await mkdir(join(fixture.dir, "data"), { recursive: true });
   await writeFile(
     join(fixture.dir, "data", "session-state.json"),
     `${JSON.stringify({
       version: 2,
       poolEntries: [{ key: poolKey, displayName: "Mobile Studio 1", createdAt: new Date().toISOString() }],
-      projectBindings: { [poolKey]: "projects/example" },
+      projectBindings: { [poolKey]: "bound-repository" },
     })}\n`,
   );
   const server = await fixture.start(1);
@@ -351,7 +486,8 @@ test("send accepts only a bound, allowed project action and protects calculated 
         type: "project_action",
         meta: {
           action: "review_changes",
-          projectPath: "projects/example",
+          projectPath: "bound-repository",
+          branch: "forged-client-branch",
           sessionKey: "agent:main:unrelated",
           agentId: "forged-agent",
           command: "/forged",
@@ -375,7 +511,8 @@ test("send accepts only a bound, allowed project action and protects calculated 
     agentId: "main",
     messageLength: 5,
     action: "review_changes",
-    projectPath: "projects/example",
+    projectPath: "bound-repository",
+    branch: "trusted-server-branch",
   });
 });
 

@@ -17,3 +17,8 @@ export function attachmentItemsForSend(state, sessionKey, includeAttachments = t
   if (!includeAttachments) return [];
   return attachmentQueue(state, sessionKey).filter((item) => item.status === "uploaded" && item.attachment);
 }
+
+export function attachmentFilesWithinLimit(state, sessionKey, files, limit = 5) {
+  const remaining = Math.max(0, limit - attachmentQueue(state, sessionKey).length);
+  return Array.from(files || []).slice(0, remaining);
+}
